@@ -8,11 +8,13 @@ This script replicates the paper's methodology exactly:
 - Parameters: S = solutions sought, R = max relay legs
 """
 
-import subprocess
 import json
 from pathlib import Path
 from typing import Dict, Any, List
 import csv
+
+# Import the reusable function from relay_bp_detailed
+from relay_bp_detailed import run_relay_bp_experiment
 
 
 class RelayBPPaperStudy:
@@ -45,33 +47,27 @@ class RelayBPPaperStudy:
         
         print(f"Running {config['name']}...")
         
-        # Build command using the detailed decoder with virtual environment activation
-        cmd = [
-            'bash', '-c', 
-            f'source venv/bin/activate && python relay_bp_detailed.py '
-            f'--circuit bicycle_bivariate_144_12_12_memory_choi_XZ '
-            f'--basis xz '
-            f'--error-rate 0.003 --distance 12 --rounds 12 '
-            f'--num-sets {config["num_sets"]} '
-            f'--gamma0 {config["gamma0"]} '
-            f'--gamma-dist-min {config["gamma_dist_interval"][0]} '
-            f'--gamma-dist-max {config["gamma_dist_interval"][1]} '
-            f'--pre-iter {config["pre_iter"]} '
-            f'--set-max-iter {config["set_max_iter"]} '
-            f'--stop-nconv {config["stop_nconv"]} '
-            f'--target-errors 20 '
-            f'--batch 2000 '
-            f'--parallel '
-            f'--measure-time '
-            f'--output-format json'
-        ]
-        
         try:
-            # Run the command
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            
-            # Parse JSON output
-            output_data = json.loads(result.stdout.strip())
+            # Run the Relay-BP experiment directly using the reusable function
+            output_data = run_relay_bp_experiment(
+                circuit='bicycle_bivariate_144_12_12_memory_choi_XZ',
+                basis='xz',
+                distance=12,
+                rounds=12,
+                error_rate=0.003,
+                gamma0=config['gamma0'],
+                pre_iter=config['pre_iter'],
+                num_sets=config['num_sets'],
+                set_max_iter=config['set_max_iter'],
+                gamma_dist_min=config['gamma_dist_interval'][0],
+                gamma_dist_max=config['gamma_dist_interval'][1],
+                stop_nconv=config['stop_nconv'],
+                target_errors=20,
+                batch=2000,
+                max_shots=1000000,
+                parallel=True,
+                measure_time=True
+            )
             
             # Add configuration info
             output_data['config_name'] = config['name']
@@ -79,6 +75,8 @@ class RelayBPPaperStudy:
             output_data['stop_nconv'] = config['stop_nconv']
             output_data['gamma0'] = config['gamma0']
             output_data['gamma_dist_interval'] = config['gamma_dist_interval']
+            output_data['pre_iter'] = config['pre_iter']
+            output_data['set_max_iter'] = config['set_max_iter']
             
             print(f"  LER: {output_data['logical_error_rate']:.2e}, Per-cycle LER: {output_data['per_cycle_logical_error_rate']:.2e}")
             print(f"  Avg BP iterations: {output_data['avg_bp_iterations']:.1f} (legs: {output_data['avg_legs']:.1f})")
@@ -122,12 +120,41 @@ class RelayBPPaperStudy:
         
         csv_path = self.output_dir / "paper_study_results.csv"
         with open(csv_path, 'w', newline='') as csvfile:
-            fieldnames = ['config_name', 'num_sets', 'stop_nconv', 'gamma0', 'shots', 'logical_errors', 
-                         'logical_error_rate', 'per_cycle_logical_error_rate', 'avg_bp_iterations', 'avg_legs']
+            fieldnames = [
+                # Configuration parameters
+                'config_name', 'num_sets', 'stop_nconv', 'gamma0', 'gamma_dist_min', 'gamma_dist_max',
+                'pre_iter', 'set_max_iter', 'circuit', 'distance', 'rounds', 'error_rate', 'basis',
+                # Experiment results
+                'shots', 'logical_errors', 'logical_error_rate', 'per_cycle_logical_error_rate',
+                'avg_bp_iterations', 'avg_legs', 'runtime_per_shot_ns'
+            ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             for result in self.results:
-                writer.writerow({k: result.get(k, '') for k in fieldnames})
+                # Extract all parameters from config and results
+                row = {
+                    'config_name': result.get('config_name', ''),
+                    'num_sets': result.get('num_sets', ''),
+                    'stop_nconv': result.get('stop_nconv', ''),
+                    'gamma0': result.get('gamma0', ''),
+                    'gamma_dist_min': result.get('gamma_dist_interval', [None, None])[0] if result.get('gamma_dist_interval') else '',
+                    'gamma_dist_max': result.get('gamma_dist_interval', [None, None])[1] if result.get('gamma_dist_interval') else '',
+                    'pre_iter': result.get('pre_iter', ''),
+                    'set_max_iter': result.get('set_max_iter', ''),
+                    'circuit': result.get('config', {}).get('circuit', ''),
+                    'distance': result.get('config', {}).get('distance', ''),
+                    'rounds': result.get('config', {}).get('rounds', ''),
+                    'error_rate': result.get('config', {}).get('error_rate', ''),
+                    'basis': 'xz',  # Fixed for this study
+                    'shots': result.get('shots', ''),
+                    'logical_errors': result.get('logical_errors', ''),
+                    'logical_error_rate': result.get('logical_error_rate', ''),
+                    'per_cycle_logical_error_rate': result.get('per_cycle_logical_error_rate', ''),
+                    'avg_bp_iterations': result.get('avg_bp_iterations', ''),
+                    'avg_legs': result.get('avg_legs', ''),
+                    'runtime_per_shot_ns': result.get('runtime_per_shot_ns', '')
+                }
+                writer.writerow(row)
         
         print(f"Results saved to: {csv_path}")
     
@@ -150,21 +177,6 @@ class RelayBPPaperStudy:
         if not self.results:
             print("No results to plot")
             return
-        
-        print("\nPerformance Data for Plotting:")
-        print("=" * 60)
-        print("R (num_sets) | BP Iterations | Legs | LER | Per-cycle LER")
-        print("-" * 60)
-        
-        for result in self.results:
-            print(f"{result['num_sets']:>11} | {result['avg_bp_iterations']:>13.1f} | {result['avg_legs']:>4.1f} | {result['logical_error_rate']:>3.2e} | {result['per_cycle_logical_error_rate']:>13.2e}")
-        
-        print("\nData saved to CSV for external plotting tools.")
-        print("You can use the CSV file with tools like:")
-        print("- Python matplotlib/pandas")
-        print("- R")
-        print("- Excel")
-        print("- Any other plotting software")
 
 
 def main():

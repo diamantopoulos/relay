@@ -57,6 +57,32 @@ def parse_args():
 
 def run_relay_bp_detailed(args):
     """Run Relay-BP with detailed iteration counting."""
+    return run_relay_bp_experiment(
+        circuit=args.circuit,
+        basis=args.basis,
+        distance=args.distance,
+        rounds=args.rounds,
+        error_rate=args.error_rate,
+        gamma0=args.gamma0,
+        pre_iter=args.pre_iter,
+        num_sets=args.num_sets,
+        set_max_iter=args.set_max_iter,
+        gamma_dist_min=args.gamma_dist_min,
+        gamma_dist_max=args.gamma_dist_max,
+        stop_nconv=args.stop_nconv,
+        target_errors=args.target_errors,
+        batch=args.batch,
+        max_shots=args.max_shots,
+        parallel=args.parallel,
+        measure_time=args.measure_time
+    )
+
+
+def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0, pre_iter, 
+                           num_sets, set_max_iter, gamma_dist_min, gamma_dist_max, stop_nconv,
+                           target_errors=20, batch=2000, max_shots=1000000, parallel=True, 
+                           measure_time=True):
+    """Run Relay-BP experiment with detailed iteration counting - reusable function."""
     
     # Deterministic seeding (optional but helpful for reproducibility)
     try:
@@ -67,20 +93,20 @@ def run_relay_bp_detailed(args):
         pass
 
     # Get test circuit
-    circuit = get_test_circuit(
-        circuit=args.circuit, 
-        distance=args.distance, 
-        rounds=args.rounds, 
-        error_rate=args.error_rate
+    circuit_obj = get_test_circuit(
+        circuit=circuit, 
+        distance=distance, 
+        rounds=rounds, 
+        error_rate=error_rate
     )
     
     # Apply basis filtering based on argument
-    if args.basis == 'z':
-        circuit = filter_detectors_by_basis(circuit, "Z")
+    if basis == 'z':
+        circuit_obj = filter_detectors_by_basis(circuit_obj, "Z")
     # For XZ decoding, don't filter (keep all observables)
     
     # Create detector error model
-    dem = circuit.detector_error_model()
+    dem = circuit_obj.detector_error_model()
     
     # Check observables count
     print(f"DEM stats: detectors={dem.num_detectors}, observables={dem.num_observables}")
@@ -96,12 +122,12 @@ def run_relay_bp_detailed(args):
     decoder = relay_bp.RelayDecoderF64(
         check_matrices.check_matrix,
         error_priors=check_matrices.error_priors,
-        gamma0=args.gamma0,
-        pre_iter=args.pre_iter,
-        num_sets=args.num_sets,
-        set_max_iter=args.set_max_iter,
-        gamma_dist_interval=(args.gamma_dist_min, args.gamma_dist_max),
-        stop_nconv=args.stop_nconv,
+        gamma0=gamma0,
+        pre_iter=pre_iter,
+        num_sets=num_sets,
+        set_max_iter=set_max_iter,
+        gamma_dist_interval=(gamma_dist_min, gamma_dist_max),
+        stop_nconv=stop_nconv,
         stopping_criterion="nconv",
         logging=False,
     )
@@ -118,35 +144,33 @@ def run_relay_bp_detailed(args):
     avg_bp_iterations = 0.0  # Will be updated
     
     # Error-targeted collection (prevents LER=0 and stabilizes estimates)
-    target_errors = args.target_errors
-    batch = args.batch
     # Apply heuristic to avoid stopping too early at low LER
-    heuristic_max = 100 * target_errors * args.rounds
-    max_shots = max(args.max_shots, heuristic_max)
+    heuristic_max = 100 * target_errors * rounds
+    max_shots = max(max_shots, heuristic_max)
     
     total_shots = 0
     total_errors = 0
     bp_iters_all = []
     legs_all = []
     
-    sampler = circuit.compile_detector_sampler()
+    sampler = circuit_obj.compile_detector_sampler()
     print(f"Collecting until {target_errors} errors or {max_shots} shots...")
 
     # Measure time around the actual error-targeted collection loop
-    start_time = time.time() if args.measure_time else None
+    start_time = time.time() if measure_time else None
     
     while total_errors < target_errors and total_shots < max_shots:
         synd, obs = sampler.sample(batch, separate_observables=True)
         synd_u8 = synd.astype(np.uint8)
         
         # Get detailed results for iteration counting
-        det = observable_decoder.decode_detailed_batch(synd_u8, parallel=args.parallel)
+        det = observable_decoder.decode_detailed_batch(synd_u8, parallel=parallel)
         bp_iters_all.extend([r.iterations for r in det])  # r.iterations = BP iterations
         # Convert BP iterations to legs for display
-        legs_all.extend(1.0 + np.maximum(0.0, (np.array([r.iterations for r in det]) - args.pre_iter) / args.set_max_iter))
+        legs_all.extend(1.0 + np.maximum(0.0, (np.array([r.iterations for r in det]) - pre_iter) / set_max_iter))
         
         # Get predictions for error counting
-        pred = observable_decoder.decode_observables_batch(synd_u8, parallel=args.parallel)
+        pred = observable_decoder.decode_observables_batch(synd_u8, parallel=parallel)
         
         # Count errors
         assert pred.shape == obs.shape and pred.shape[1] > 0, \
@@ -166,7 +190,7 @@ def run_relay_bp_detailed(args):
     logical_error_rate = total_errors / total_shots if total_shots > 0 else 0.0
     
     # Calculate per-cycle logical error rate (as per paper)
-    per_cycle_logical_error_rate = 1 - (1 - logical_error_rate) ** (1 / args.rounds)
+    per_cycle_logical_error_rate = 1 - (1 - logical_error_rate) ** (1 / rounds)
     
     # Calculate averages from collected data
     if bp_iters_all:
@@ -178,8 +202,8 @@ def run_relay_bp_detailed(args):
     
     # Calculate runtime per shot
     runtime_per_shot = None
-    end_time = time.time() if args.measure_time else None
-    if args.measure_time and start_time and end_time and total_shots > 0:
+    end_time = time.time() if measure_time else None
+    if measure_time and start_time and end_time and total_shots > 0:
         total_runtime_seconds = end_time - start_time
         runtime_per_shot = (total_runtime_seconds * 1e9) / total_shots  # Convert to nanoseconds
     
@@ -192,14 +216,14 @@ def run_relay_bp_detailed(args):
         'avg_bp_iterations': float(avg_bp_iterations),  # Paper's x-axis
         'avg_legs': float(avg_legs),  # For debugging
         'config': {
-            'gamma0': float(args.gamma0),
-            'num_sets': int(args.num_sets),
-            'stop_nconv': int(args.stop_nconv),
-            'gamma_dist_interval': (float(args.gamma_dist_min), float(args.gamma_dist_max)),
-            'circuit': str(args.circuit),
-            'distance': int(args.distance),
-            'rounds': int(args.rounds),
-            'error_rate': float(args.error_rate),
+            'gamma0': float(gamma0),
+            'num_sets': int(num_sets),
+            'stop_nconv': int(stop_nconv),
+            'gamma_dist_interval': (float(gamma_dist_min), float(gamma_dist_max)),
+            'circuit': str(circuit),
+            'distance': int(distance),
+            'rounds': int(rounds),
+            'error_rate': float(error_rate),
         }
     }
     
