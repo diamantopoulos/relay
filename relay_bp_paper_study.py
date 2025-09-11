@@ -27,19 +27,21 @@ class RelayBPPaperStudy:
         
     
     def define_parameter_grid(self):
-        # Sweep different R values (num_sets) while keeping S=1 constant
-        num_sets_values = [3, 5]
+        # Sweep different R values (num_sets) and S values (stop_nconv)
+        num_sets_values = [1, 3, 5, 7, 9, 11]
+        stop_nconv_values = [1, 2, 3, 5, 7]  # S values to sweep
         configs = []
         for r in num_sets_values:
-            configs.append({
-                'name': f'Relay-BP-R{r}',
-                'num_sets': r,
-                'gamma0': 0.125,
-                'gamma_dist_interval': (-0.24, 0.66),
-                'pre_iter': 80,
-                'set_max_iter': 60,
-                'stop_nconv': 1,  # Keep S=1 constant
-            })
+            for s in stop_nconv_values:
+                configs.append({
+                    'name': f'Relay-BP-R{r}-S{s}',
+                    'num_sets': r,
+                    'gamma0': 0.125,
+                    'gamma_dist_interval': (-0.24, 0.66),
+                    'pre_iter': 80,
+                    'set_max_iter': 60,
+                    'stop_nconv': s,
+                })
         return configs
 
     def run_single_config(self, config: Dict[str, Any], shots: int = 1000) -> Dict[str, Any]:
@@ -62,8 +64,8 @@ class RelayBPPaperStudy:
                 gamma_dist_min=config['gamma_dist_interval'][0],
                 gamma_dist_max=config['gamma_dist_interval'][1],
                 stop_nconv=config['stop_nconv'],
-                target_errors=20,
-                batch=2000,
+                target_errors=100,
+                batch=20000,
                 max_shots=1000000,
                 parallel=True,
                 measure_time=True
@@ -165,11 +167,11 @@ class RelayBPPaperStudy:
             return
         
         print("\nSummary Table:")
-        print("=" * 80)
-        print(f"{'R (num_sets)':<12} {'BP Iterations':<15} {'Legs':<8} {'LER':<12} {'Per-cycle LER':<15}")
-        print("-" * 80)
+        print("=" * 100)
+        print(f"{'R (num_sets)':<12} {'S (stop_nconv)':<15} {'BP Iterations':<15} {'Legs':<8} {'LER':<12} {'Per-cycle LER':<15}")
+        print("-" * 100)
         for result in self.results:
-            print(f"{result['num_sets']:<12} {result['avg_bp_iterations']:<15.1f} {result['avg_legs']:<8.1f} {result['logical_error_rate']:<12.2e} {result['per_cycle_logical_error_rate']:<15.2e}")
+            print(f"{result['num_sets']:<12} {result['stop_nconv']:<15} {result['avg_bp_iterations']:<15.1f} {result['avg_legs']:<8.1f} {result['logical_error_rate']:<12.2e} {result['per_cycle_logical_error_rate']:<15.2e}")
     
     def plot_performance_curves(self):
         """Print performance data for manual plotting."""
