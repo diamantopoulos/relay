@@ -23,35 +23,10 @@ class RelayBPPaperStudy:
         self.output_dir.mkdir(exist_ok=True)
         self.results = []
         
-    def define_parameter_gridOLD(self) -> List[Dict[str, Any]]:
-        """Define the parameter grid matching the paper's methodology."""
-        
-        # Paper's Relay-BP variants: S = solutions sought (stop_nconv)
-        paper_variants = [1, 3, 5, 7, 9]
-        
-        configs = []
-        
-        # Optional anchors removed; we now sweep R for each S
-        
-        # Sweep R values for each S (paper-style families)
-        sweep_r_values = [50, 100, 200, 400, 600, 800]
-        for s in paper_variants:
-            for r in sweep_r_values:
-                configs.append({
-                    'name': f'Relay-BP-{s}-R{r}',
-                    'num_sets': r,
-                    'gamma0': 0.125,
-                    'gamma_dist_interval': (-0.24, 0.66),
-                    'pre_iter': 80,
-                    'set_max_iter': 60,
-                    'stop_nconv': s,
-                })
-        
-        return configs
     
     def define_parameter_grid(self):
         # Sweep different R values (num_sets) while keeping S=1 constant
-        num_sets_values = [1, 2, 3, 5]
+        num_sets_values = [3, 5]
         configs = []
         for r in num_sets_values:
             configs.append({
@@ -70,24 +45,25 @@ class RelayBPPaperStudy:
         
         print(f"Running {config['name']}...")
         
-        # Build command using the detailed decoder
+        # Build command using the detailed decoder with virtual environment activation
         cmd = [
-            'python', 'relay_bp_detailed.py',
-            '--circuit', 'bicycle_bivariate_144_12_12_memory_choi_XZ',
-            '--basis', 'xz',
-            '--error-rate', '0.003', '--distance', '12', '--rounds', '12',
-            '--num-sets', str(config['num_sets']),
-            '--gamma0', str(config['gamma0']),
-            '--gamma-dist-min', str(config['gamma_dist_interval'][0]),
-            '--gamma-dist-max', str(config['gamma_dist_interval'][1]),
-            '--pre-iter', str(config['pre_iter']),
-            '--set-max-iter', str(config['set_max_iter']),
-            '--stop-nconv', str(config['stop_nconv']),
-            '--target-errors', '20',
-            '--batch', '2000',
-            '--parallel',
-            '--measure-time',
-            '--output-format', 'json'
+            'bash', '-c', 
+            f'source venv/bin/activate && python relay_bp_detailed.py '
+            f'--circuit bicycle_bivariate_144_12_12_memory_choi_XZ '
+            f'--basis xz '
+            f'--error-rate 0.003 --distance 12 --rounds 12 '
+            f'--num-sets {config["num_sets"]} '
+            f'--gamma0 {config["gamma0"]} '
+            f'--gamma-dist-min {config["gamma_dist_interval"][0]} '
+            f'--gamma-dist-max {config["gamma_dist_interval"][1]} '
+            f'--pre-iter {config["pre_iter"]} '
+            f'--set-max-iter {config["set_max_iter"]} '
+            f'--stop-nconv {config["stop_nconv"]} '
+            f'--target-errors 20 '
+            f'--batch 2000 '
+            f'--parallel '
+            f'--measure-time '
+            f'--output-format json'
         ]
         
         try:
