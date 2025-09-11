@@ -12,6 +12,7 @@ import numpy as np
 import sys
 import random
 from pathlib import Path
+from datetime import datetime
 sys.path.append(str(Path(__file__).parent / "tests"))
 from testdata import get_test_circuit, filter_detectors_by_basis
 
@@ -25,21 +26,21 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Run Relay-BP decoder with detailed iteration counting')
     
     # Circuit parameters
-    parser.add_argument('--circuit', type=str, default='bicycle_bivariate_144_12_12_memory_Z',
+    parser.add_argument('--circuit', type=str, default='bicycle_bivariate_144_12_12_memory_choi_XZ',
                        help='Circuit name (default: bicycle_bivariate_144_12_12_memory_Z)')
+    parser.add_argument('--basis', type=str, choices=['z', 'xz'], default='xz', help='Decoding basis (default: xz)')
     parser.add_argument('--distance', type=int, default=12, help='Code distance (default: 12)')
     parser.add_argument('--rounds', type=int, default=12, help='Number of rounds (default: 12)')
     parser.add_argument('--error-rate', type=float, default=0.003, help='Physical error rate (default: 0.003)')
     parser.add_argument('--shots', type=int, default=1000, help='Number of shots (default: 1000)')
-    parser.add_argument('--basis', type=str, choices=['z', 'xz'], default='xz', help='Decoding basis (default: xz)')
-    parser.add_argument('--target-errors', type=int, default=200, help='Target number of errors to collect (default: 200)')
+    parser.add_argument('--target-errors', type=int, default=10, help='Target number of errors to collect (default: 10)')
     parser.add_argument('--batch', type=int, default=2000, help='Batch size for error collection (default: 2000)')
     parser.add_argument('--max-shots', type=int, default=1000000, help='Maximum shots to collect (default: 1000000)')
     
     # Relay-BP parameters
     parser.add_argument('--gamma0', type=float, default=0.125, help='Ordered memory parameter (default: 0.125)')
     parser.add_argument('--pre-iter', type=int, default=80, help='Pre-iterations (default: 80)')
-    parser.add_argument('--num-sets', type=int, default=301, help='Number of Relay-BP sets (default: 301)')
+    parser.add_argument('--num-sets', type=int, default=3, help='Number of Relay-BP sets (default: 10)')
     parser.add_argument('--set-max-iter', type=int, default=60, help='Max iterations per set (default: 60)')
     parser.add_argument('--gamma-dist-min', type=float, default=-0.24, help='Gamma distribution minimum (default: -0.24)')
     parser.add_argument('--gamma-dist-max', type=float, default=0.66, help='Gamma distribution maximum (default: 0.66)')
@@ -125,6 +126,7 @@ def run_relay_bp_detailed(args):
     
     total_shots = 0
     total_errors = 0
+    bp_iters_all = []
     legs_all = []
     
     sampler = circuit.compile_detector_sampler()
@@ -139,7 +141,9 @@ def run_relay_bp_detailed(args):
         
         # Get detailed results for iteration counting
         det = observable_decoder.decode_detailed_batch(synd_u8, parallel=args.parallel)
-        legs_all.extend([r.iterations for r in det])
+        bp_iters_all.extend([r.iterations for r in det])  # r.iterations = BP iterations
+        # Convert BP iterations to legs for display
+        legs_all.extend(1.0 + np.maximum(0.0, (np.array([r.iterations for r in det]) - args.pre_iter) / args.set_max_iter))
         
         # Get predictions for error counting
         pred = observable_decoder.decode_observables_batch(synd_u8, parallel=args.parallel)
@@ -164,16 +168,13 @@ def run_relay_bp_detailed(args):
     # Calculate per-cycle logical error rate (as per paper)
     per_cycle_logical_error_rate = 1 - (1 - logical_error_rate) ** (1 / args.rounds)
     
-    # Update BP iterations calculation with collected data
-    if legs_all:
-        legs = np.asarray(legs_all, dtype=float)
-        avg_legs = float(legs.mean())
-        T0 = args.pre_iter  # 80
-        Tr = args.set_max_iter  # 60
-        avg_bp_iterations = T0 + max(0.0, avg_legs - 1.0) * Tr
+    # Calculate averages from collected data
+    if bp_iters_all:
+        avg_bp_iterations = float(np.mean(bp_iters_all))
+        avg_legs = float(np.mean(legs_all))
     else:
-        avg_legs = 0.0
         avg_bp_iterations = 0.0
+        avg_legs = 0.0
     
     # Calculate runtime per shot
     runtime_per_shot = None
@@ -211,6 +212,49 @@ def run_relay_bp_detailed(args):
 def main():
     """Main function."""
     args = parse_args()
+    
+    # Print experiment start information
+    print("=" * 80)
+    print("RELAY-BP DETAILED DECODER EXPERIMENT")
+    print("=" * 80)
+    print(f"Experiment started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print()
+    
+    # Print all configuration options
+    print("CONFIGURATION OPTIONS:")
+    print("-" * 40)
+    
+    # Circuit parameters
+    print("Circuit Parameters:")
+    print(f"  Circuit: {args.circuit}")
+    print(f"  Distance: {args.distance}")
+    print(f"  Rounds: {args.rounds}")
+    print(f"  Error Rate: {args.error_rate}")
+    print(f"  Basis: {args.basis}")
+    print()
+    
+    # Relay-BP parameters
+    print("Relay-BP Parameters:")
+    print(f"  Gamma0: {args.gamma0}")
+    print(f"  Pre-iterations: {args.pre_iter}")
+    print(f"  Number of Sets: {args.num_sets}")
+    print(f"  Set Max Iterations: {args.set_max_iter}")
+    print(f"  Gamma Distribution: [{args.gamma_dist_min}, {args.gamma_dist_max}]")
+    print(f"  Stop N Converged: {args.stop_nconv}")
+    print()
+    
+    # Execution parameters
+    print("Execution Parameters:")
+    print(f"  Shots: {args.shots}")
+    print(f"  Target Errors: {args.target_errors}")
+    print(f"  Batch Size: {args.batch}")
+    print(f"  Max Shots: {args.max_shots}")
+    print(f"  Parallel: {args.parallel}")
+    print(f"  Output Format: {args.output_format}")
+    print(f"  Measure Time: {args.measure_time}")
+    print()
+    print("=" * 80)
+    print()
     
     # Run Relay-BP with detailed counting
     results = run_relay_bp_detailed(args)
