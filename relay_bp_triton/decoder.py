@@ -151,6 +151,7 @@ class RelayBPDecoder:
         self.CHECK_EVERY = 16  # Check stop flag every N iterations
         
         # Constants for kernel batching (reduce launch overhead)
+        self.ROWS_PER_PROG_C2V = 8  # Number of rows per C2V program
         self.ROWS_PER_PROG_V2C = 8  # Number of rows per V2C program
         self.ROWS_PER_PROG_PAR = 8  # Number of rows per parity program
     
@@ -196,7 +197,8 @@ class RelayBPDecoder:
         use_alpha = self.normalized_min_sum_alpha is not None
         use_beta = self.offset_min_sum_beta is not None
         
-        grid = (B * self.C,)
+        total = B * self.C
+        grid = ((total + self.ROWS_PER_PROG_C2V - 1) // self.ROWS_PER_PROG_C2V,)
         
         msg_is_fp16 = (self.msg_dtype == torch.float16)
         
@@ -208,6 +210,7 @@ class RelayBPDecoder:
             alpha, beta, use_alpha, use_beta,
             msg_is_fp16,
             self.c2v_config['BLOCK_SIZE'],
+            ROWS_PER_PROG=self.ROWS_PER_PROG_C2V,
             num_warps=self.c2v_config['num_warps'],
             num_stages=self.c2v_config['num_stages']
         )
@@ -358,8 +361,8 @@ class RelayBPDecoder:
         tensors['gamma'][:] = gamma0_tensor
         
         for t in range(self.pre_iter):
-            self._launch_c2v_kernel(tensors, B)
-            self._launch_v2c_fused_gamma_kernel(tensors, B)  # Fused V2C + gamma mixing
+            self._launch_c2v_kernel(tensors, B)                  # produces ν
+            self._launch_v2c_fused_gamma_kernel(tensors, B)      # V2C + gamma mixing (no atomics)
             
             # Check parity and select solutions only every CHECK_EVERY iterations
             if (t + 1) % self.CHECK_EVERY == 0:
@@ -379,8 +382,8 @@ class RelayBPDecoder:
             tensors['gamma'][:] = gamma_leg
             
             for t in range(self.set_max_iter):
-                self._launch_c2v_kernel(tensors, B)
-                self._launch_v2c_fused_gamma_kernel(tensors, B)  # Fused V2C + gamma mixing
+                self._launch_c2v_kernel(tensors, B)                  # produces ν
+                self._launch_v2c_fused_gamma_kernel(tensors, B)      # V2C + gamma mixing (no atomics)
                 
                 # Check parity and select solutions only every CHECK_EVERY iterations
                 if (t + 1) % self.CHECK_EVERY == 0:

@@ -26,92 +26,139 @@ def c2v_min_sum_kernel(
     use_alpha: tl.constexpr, use_beta: tl.constexpr,
     msg_is_fp16: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ROWS_PER_PROG: tl.constexpr,  # Number of rows to process per program
 ):
-    """Check-to-variable min-sum kernel with proper two-pass implementation."""
+    """Check-to-variable min-sum kernel with proper two-pass implementation (batched)."""
     pid = tl.program_id(axis=0)
-    b = pid // C
-    i = pid % C
-    if (b >= B) | (i >= C):
-        return
-
-    row_start = tl.load(chk_ptr + i)
-    row_end   = tl.load(chk_ptr + i + 1)
-    deg = row_end - row_start
-    if deg <= 0:
-        return
-
-    # ---------- PASS 1: parity + min1/min2/argmin (vectorized) ----------
-    neg_parity = tl.zeros((), dtype=tl.int32)
-    min1 = tl.full((), 1e30, dtype=tl.float32)  # fp32 for accuracy
-    min2 = tl.full((), 1e30, dtype=tl.float32)  # fp32 for accuracy
-    argmin_e = tl.full((), -1,   dtype=tl.int32)
-
-    tile = row_start
-    while tile < row_end:
-        offs = tile + tl.arange(0, BLOCK_SIZE)
-        m    = offs < row_end
-        e    = tl.load(chk_edges + offs, mask=m, other=0)
-        mu_e = tl.load(mu + b*E + e,     mask=m, other=0.0)
-
-        # parity (count negatives)
-        neg_parity += tl.sum((mu_e < 0.0) & m, axis=0).to(tl.int32)
-
-        a       = tl.abs(mu_e.to(tl.float32))
-        a_mask  = tl.where(m, a, 1e30)
-
-        # tile min1 / argmin
-        # Triton has only argmax; use -a to emulate argmin
-        pos1    = tl.argmax(-a_mask, axis=0)
-        min1_t  = tl.max(-a_mask, axis=0) * (-1.0)  # == min over a_mask
-        e1_t    = tl.load(chk_edges + tile + pos1)
-
-        # tile min2 = min over a except argmin lane
-        a_mask2 = tl.where(tl.arange(0, BLOCK_SIZE) == pos1, 1e30, a_mask)
-        min2_t  = tl.min(a_mask2, axis=0)
-
-        # merge (global) min1/min2 with tile values
-        better1 = min1_t < min1
-        # if tile beats global min1: new min2 is min(old min1, tile min2); else include tile min1
-        min2    = tl.where(better1, tl.minimum(min1, min2_t), tl.minimum(min2, min1_t))
-        min1    = tl.where(better1, min1_t, min1)
-        argmin_e= tl.where(better1, e1_t,   argmin_e)
-
-        tile += BLOCK_SIZE
-
-    # degree-1: outgoing magnitude must be 0
-    deg_is_one = (deg == 1)
+    base = pid * ROWS_PER_PROG
     
-    # include syndrome bit in sign product
-    syn = tl.load(syndrome + b*C + i).to(tl.int32) & 1
-    # parity bit = (neg_parity & 1) XOR syn
-    par_bit = ((neg_parity & 1) ^ syn)
-    sign_prod = tl.where(par_bit == 0, 1.0, -1.0)
+    # Process up to ROWS_PER_PROG {b,i} pairs
+    for r in tl.static_range(0, ROWS_PER_PROG):
+        idx = base + r
+        # Only process if within bounds
+        if idx < B * C:
+            b = idx // C
+            i = idx % C
 
-    # ---------- PASS 2: write nu (vectorized) ----------
-    tile = row_start
-    while tile < row_end:
-        offs = tile + tl.arange(0, BLOCK_SIZE)
-        m    = offs < row_end
-        e    = tl.load(chk_edges + offs, mask=m, other=0)
-        mu_e = tl.load(mu + b*E + e,     mask=m, other=0.0)
-        sgn_mu = tl.where(mu_e >= 0.0, 1.0, -1.0)
+            row_start = tl.load(chk_ptr + i)
+            row_end   = tl.load(chk_ptr + i + 1)
+            deg = row_end - row_start
+            if deg > 0:
+                # ---------- PASS 1: parity + min1/min2/argmin (vectorized) ----------
+                neg_parity = tl.zeros((), dtype=tl.int32)
+                min1 = tl.full((), 1e30, dtype=tl.float32)  # fp32 for accuracy
+                min2 = tl.full((), 1e30, dtype=tl.float32)  # fp32 for accuracy
+                argmin_e = tl.full((), -1,   dtype=tl.int32)
 
-        is_min1_edge = (e == argmin_e)
-        out_mag = tl.where(is_min1_edge, min2, min1)
-        out_mag = tl.where(deg_is_one, 0.0, out_mag)
+                tile = row_start
+                while tile < row_end:
+                    offs = tile + tl.arange(0, BLOCK_SIZE)
+                    m    = offs < row_end
+                    e    = tl.load(chk_edges + offs, mask=m, other=0)
+                    mu_e = tl.load(mu + b*E + e,     mask=m, other=0.0)
 
-        if use_alpha:
-            out_mag = alpha * out_mag
-        if use_beta:
-            out_mag = tl.maximum(out_mag - beta, 0.0)
+                    # parity (count negatives)
+                    neg_parity += tl.sum((mu_e < 0.0) & m, axis=0).to(tl.int32)
 
-        nu_e = (sign_prod * sgn_mu) * out_mag
-        if msg_is_fp16:
-            tl.store(nu + b*E + e, nu_e.to(tl.float16), mask=m)
-        else:
-            tl.store(nu + b*E + e, nu_e, mask=m)
+                    a       = tl.abs(mu_e.to(tl.float32))
+                    a_mask  = tl.where(m, a, 1e30)
 
-        tile += BLOCK_SIZE
+                    # tile min1 / argmin
+                    # Triton has only argmax; use -a to emulate argmin
+                    pos1    = tl.argmax(-a_mask, axis=0)
+                    min1_t  = tl.max(-a_mask, axis=0) * (-1.0)  # == min over a_mask
+                    e1_t    = tl.load(chk_edges + tile + pos1)
+
+                    # tile min2 = min over a except argmin lane
+                    a_mask2 = tl.where(tl.arange(0, BLOCK_SIZE) == pos1, 1e30, a_mask)
+                    min2_t  = tl.min(a_mask2, axis=0)
+
+                    # merge (global) min1/min2 with tile values
+                    better1 = min1_t < min1
+                    # if tile beats global min1: new min2 is min(old min1, tile min2); else include tile min1
+                    min2    = tl.where(better1, tl.minimum(min1, min2_t), tl.minimum(min2, min1_t))
+                    min1    = tl.where(better1, min1_t, min1)
+                    argmin_e= tl.where(better1, e1_t,   argmin_e)
+
+                    tile += BLOCK_SIZE
+
+                # degree-1: outgoing magnitude must be 0
+                deg_is_one = (deg == 1)
+                
+                # include syndrome bit in sign product
+                syn = tl.load(syndrome + b*C + i).to(tl.int32) & 1
+                # parity bit = (neg_parity & 1) XOR syn
+                par_bit = ((neg_parity & 1) ^ syn)
+                sign_prod = tl.where(par_bit == 0, 1.0, -1.0)
+
+                # ---------- PASS 2: write nu (vectorized) ----------
+                tile = row_start
+                while tile < row_end:
+                    offs = tile + tl.arange(0, BLOCK_SIZE)
+                    m    = offs < row_end
+                    e    = tl.load(chk_edges + offs, mask=m, other=0)
+                    mu_e = tl.load(mu + b*E + e,     mask=m, other=0.0)
+                    sgn_mu = tl.where(mu_e >= 0.0, 1.0, -1.0)
+
+                    is_min1_edge = (e == argmin_e)
+                    out_mag = tl.where(is_min1_edge, min2, min1)
+                    out_mag = tl.where(deg_is_one, 0.0, out_mag)
+
+                    if use_alpha:
+                        out_mag = alpha * out_mag
+                    if use_beta:
+                        out_mag = tl.maximum(out_mag - beta, 0.0)
+
+                    nu_e = (sign_prod * sgn_mu) * out_mag
+                    if msg_is_fp16:
+                        tl.store(nu + b*E + e, nu_e.to(tl.float16), mask=m)
+                    else:
+                        tl.store(nu + b*E + e, nu_e, mask=m)
+
+                    tile += BLOCK_SIZE
+
+
+@triton.jit
+def sum_nu_kernel(
+    nu, var_ptr, var_edges, sum_nu,
+    B, V, E,
+    BLOCK_SIZE: tl.constexpr,
+    ROWS_PER_PROG: tl.constexpr,
+):
+    """Sum incoming ν messages per variable (no atomics)."""
+    pid = tl.program_id(axis=0)
+    base = pid * ROWS_PER_PROG
+    
+    for r in tl.static_range(0, ROWS_PER_PROG):
+        idx = base + r
+        if idx < B * V:
+            b = idx // V
+            j = idx % V
+            
+            start = tl.load(var_ptr + j)
+            end = tl.load(var_ptr + j + 1)
+            acc = tl.zeros((), dtype=tl.float32)
+            
+            tile = start
+            while tile < end:
+                offs = tile + tl.arange(0, BLOCK_SIZE)
+                m = offs < end
+                e = tl.load(var_edges + offs, mask=m, other=0)
+                nu_e = tl.load(nu + b*E + e, mask=m, other=0.0).to(tl.float32)
+                acc += tl.sum(tl.where(m, nu_e, 0.0), axis=0)
+                tile += BLOCK_SIZE
+            
+            tl.store(sum_nu + b*V + j, acc)
+
+
+@triton.jit
+def zero_sum_nu_kernel(sum_nu, B, V):
+    """Zero the sum_nu accumulator each iteration."""
+    pid = tl.program_id(axis=0)
+    b = pid // V
+    j = pid % V
+    if (b < B) & (j < V):
+        tl.store(sum_nu + b*V + j, 0.0)
 
 
 @triton.jit
@@ -380,17 +427,17 @@ class KernelAutotuner:
         else:
             degree_bucket = "large"
         
-        # Real autotuning configurations
+        # H100-optimized autotuning configurations
         configs = [
             {"BLOCK_SIZE": 32, "num_warps": 4, "num_stages": 2},
-            {"BLOCK_SIZE": 64, "num_warps": 4, "num_stages": 2},
-            {"BLOCK_SIZE": 128, "num_warps": 4, "num_stages": 2},
-            {"BLOCK_SIZE": 32, "num_warps": 8, "num_stages": 2},
-            {"BLOCK_SIZE": 64, "num_warps": 8, "num_stages": 2},
+            {"BLOCK_SIZE": 64, "num_warps": 8, "num_stages": 2},  # H100 sweet spot for C2V
             {"BLOCK_SIZE": 128, "num_warps": 8, "num_stages": 2},
-            {"BLOCK_SIZE": 32, "num_warps": 4, "num_stages": 3},
-            {"BLOCK_SIZE": 64, "num_warps": 4, "num_stages": 3},
-            {"BLOCK_SIZE": 128, "num_warps": 4, "num_stages": 3},
+            {"BLOCK_SIZE": 32, "num_warps": 6, "num_stages": 2},
+            {"BLOCK_SIZE": 64, "num_warps": 6, "num_stages": 2},
+            {"BLOCK_SIZE": 128, "num_warps": 6, "num_stages": 2},
+            {"BLOCK_SIZE": 32, "num_warps": 8, "num_stages": 3},
+            {"BLOCK_SIZE": 64, "num_warps": 8, "num_stages": 3},
+            {"BLOCK_SIZE": 128, "num_warps": 8, "num_stages": 3},
         ]
         
         # Filter configs based on degree bucket
@@ -443,6 +490,65 @@ class KernelAutotuner:
         
         self.cache[key] = config
         return config
+
+
+@triton.jit
+def marginals_and_gamma_kernel(
+    sum_nu, lam, M, hard_dec, lam0, gamma,
+    B, V,
+    WRITE_HARD: tl.constexpr  # only set True when you'll run parity
+):
+    """Per-variable marginals and gamma mixing kernel (contiguous access)."""
+    pid = tl.program_id(axis=0)
+    b = pid // V
+    j = pid % V
+    if (b >= B) | (j >= V):
+        return
+
+    lam_bj = tl.load(lam + b*V + j)
+    s = tl.load(sum_nu + b*V + j)
+    M_bj = lam_bj + s
+    tl.store(M + b*V + j, M_bj)        # needed for weights / optional for parity cadence
+
+    if WRITE_HARD:
+        tl.store(hard_dec + b*V + j, (M_bj < 0.0).to(tl.uint8))
+
+    g = tl.load(gamma + b*V + j)
+    lam0_j = tl.load(lam0 + j)
+    lam_new = (1.0 - g) * lam0_j + g * M_bj
+    tl.store(lam + b*V + j, lam_new)
+
+
+@triton.jit
+def edge_update_mu_kernel(
+    nu, mu, edge_var, lam, sum_nu,
+    B, V, E,
+    msg_is_fp16: tl.constexpr,
+    EDGES_PER_PROG: tl.constexpr   # e.g. 256
+):
+    """Edge-parallel μ update kernel with contiguous access."""
+    pid = tl.program_id(axis=0)
+    tiles_per_b = (E + EDGES_PER_PROG - 1) // EDGES_PER_PROG
+    b = pid // tiles_per_b
+    t = pid % tiles_per_b
+    if b >= B:
+        return
+
+    start = t * EDGES_PER_PROG
+    offs = start + tl.arange(0, EDGES_PER_PROG)
+    m = offs < E
+    e = offs
+
+    v = tl.load(edge_var + e, mask=m, other=0)
+    lam_bv = tl.load(lam + b*V + v, mask=m, other=0.0)
+    s_bv = tl.load(sum_nu + b*V + v, mask=m, other=0.0)
+    nu_be = tl.load(nu + b*E + e, mask=m, other=0.0)
+
+    mu_be = lam_bv + (s_bv - nu_be)
+    if msg_is_fp16:
+        tl.store(mu + b*E + e, mu_be.to(tl.float16), mask=m)
+    else:
+        tl.store(mu + b*E + e, mu_be, mask=m)
 
 
 # Global autotuner instance
