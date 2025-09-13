@@ -17,8 +17,8 @@ from typing import Dict, Optional, Tuple, Union
 
 from .graph import CSRGraph
 from .kernels import (
-    c2v_min_sum_kernel, v2c_and_marginals_kernel, gamma_mix_kernel,
-    parity_per_check_kernel, init_messages_kernel, get_autotuner
+    c2v_min_sum_kernel, v2c_and_marginals_kernel, v2c_and_marginals_fused_gamma_kernel,
+    gamma_mix_kernel, parity_per_check_kernel, init_messages_kernel, stop_flag_kernel, get_autotuner
 )
 from .utils import (
     compute_log_prior_ratios, compute_decoding_weights, sample_gamma_uniform,
@@ -46,7 +46,7 @@ class RelayBPDecoder:
         stop_nconv: int = 5,
         normalized_min_sum_alpha: Optional[float] = 0.90,
         offset_min_sum_beta: Optional[float] = None,
-        dtype_messages: str = "fp16",
+        dtype_messages: str = "fp16",  # Default to fp16 for better performance
         device: str = "cuda",
         seed: int = 1234,
         bitpack_output: bool = False
@@ -120,11 +120,13 @@ class RelayBPDecoder:
             / torch.from_numpy(self.error_priors).to(self.device, dtype=torch.float32)
         ).contiguous()  # [V], device
         
-        # Set up message dtype
+        # Set up message dtype (fp16 for messages, fp32 for accumulations)
         if dtype_messages == "fp16":
             self.msg_dtype = torch.float16
+            self.acc_dtype = torch.float32  # Accumulations in fp32
         elif dtype_messages == "fp32":
             self.msg_dtype = torch.float32
+            self.acc_dtype = torch.float32
         else:
             raise ValueError("dtype_messages must be 'fp16' or 'fp32'")
         
@@ -144,6 +146,13 @@ class RelayBPDecoder:
         
         # Pre-allocate device tensors (will be allocated in decode)
         self._device_tensors = {}
+        
+        # Constants for device-driven early exit
+        self.CHECK_EVERY = 16  # Check stop flag every N iterations
+        
+        # Constants for kernel batching (reduce launch overhead)
+        self.ROWS_PER_PROG_V2C = 8  # Number of rows per V2C program
+        self.ROWS_PER_PROG_PAR = 8  # Number of rows per parity program
     
     def _allocate_device_tensors(self, B: int):
         """Allocate device tensors for batch size B."""
@@ -151,17 +160,17 @@ class RelayBPDecoder:
             return self._device_tensors[B]
         
         tensors = {
-            # Messages
+            # Messages (fp16 for storage, fp32 for accumulations)
             'mu': torch.zeros(B, self.E, dtype=self.msg_dtype, device=self.device),
             'nu': torch.zeros(B, self.E, dtype=self.msg_dtype, device=self.device),
             
-            # Beliefs
-            'lambda_': torch.zeros(B, self.V, dtype=torch.float32, device=self.device),
-            'M': torch.zeros(B, self.V, dtype=torch.float32, device=self.device),
+            # Beliefs (fp32 for accuracy)
+            'lambda_': torch.zeros(B, self.V, dtype=self.acc_dtype, device=self.device),
+            'M': torch.zeros(B, self.V, dtype=self.acc_dtype, device=self.device),
             'hard_dec': torch.zeros(B, self.V, dtype=torch.uint8, device=self.device),
             
-            # Gamma
-            'gamma': torch.zeros(B, self.V, dtype=torch.float32, device=self.device),
+            # Gamma (fp32 for accuracy)
+            'gamma': torch.zeros(B, self.V, dtype=self.acc_dtype, device=self.device),
             
             # Syndrome and validation
             'syndrome': torch.zeros(B, self.C, dtype=torch.uint8, device=self.device),
@@ -172,6 +181,9 @@ class RelayBPDecoder:
             'best_errors': torch.zeros(B, self.V, dtype=torch.uint8, device=self.device),
             'found_count': torch.zeros(B, dtype=torch.int32, device=self.device),
             'valid_solutions': torch.zeros(B, dtype=torch.bool, device=self.device),
+            
+            # Device-driven early exit
+            'stop_flag': torch.zeros(1, dtype=torch.uint8, device=self.device),
         }
         
         self._device_tensors[B] = tensors
@@ -186,27 +198,54 @@ class RelayBPDecoder:
         
         grid = (B * self.C,)
         
+        msg_is_fp16 = (self.msg_dtype == torch.float16)
+        
         c2v_min_sum_kernel[grid](
             tensors['mu'], tensors['nu'],
             self.graph.chk_ptr, self.graph.chk_edges,
             tensors['syndrome'],                      # pass syndrome here
             B, self.C, self.E,
             alpha, beta, use_alpha, use_beta,
+            msg_is_fp16,
             self.c2v_config['BLOCK_SIZE'],
-            num_warps=self.c2v_config['num_warps']
+            num_warps=self.c2v_config['num_warps'],
+            num_stages=self.c2v_config['num_stages']
         )
     
     def _launch_v2c_kernel(self, tensors: Dict, B: int):
         """Launch variable-to-check and marginals kernel."""
         grid = (B * self.V,)
+        msg_is_fp16 = (self.msg_dtype == torch.float16)
         
         v2c_and_marginals_kernel[grid](
             tensors['nu'], tensors['mu'],
             self.graph.var_ptr, self.graph.var_edges,
             tensors['lambda_'], tensors['M'], tensors['hard_dec'],
             B, self.V, self.E,
+            msg_is_fp16,
             self.v2c_config['BLOCK_SIZE'],
-            num_warps=self.v2c_config['num_warps']
+            num_warps=self.v2c_config['num_warps'],
+            num_stages=self.v2c_config['num_stages']
+        )
+    
+    def _launch_v2c_fused_gamma_kernel(self, tensors: Dict, B: int):
+        """Launch variable-to-check and marginals kernel with fused gamma mixing."""
+        total = B * self.V
+        grid = ((total + self.ROWS_PER_PROG_V2C - 1) // self.ROWS_PER_PROG_V2C,)
+        msg_is_fp16 = (self.msg_dtype == torch.float16)
+        
+        v2c_and_marginals_fused_gamma_kernel[grid](
+            tensors['nu'], tensors['mu'],
+            self.graph.var_ptr, self.graph.var_edges,
+            tensors['lambda_'], tensors['M'], tensors['hard_dec'],
+            self.lambda0, tensors['gamma'],
+            B, self.V, self.E,
+            msg_is_fp16,
+            self.v2c_config['BLOCK_SIZE'],
+            STORE_M=False,  # Don't spill M each iter for bandwidth optimization
+            ROWS_PER_PROG=self.ROWS_PER_PROG_V2C,
+            num_warps=self.v2c_config['num_warps'],
+            num_stages=self.v2c_config['num_stages']
         )
     
     def _launch_gamma_mix_kernel(self, tensors: Dict, B: int):
@@ -221,7 +260,8 @@ class RelayBPDecoder:
     
     def _launch_parity_check_kernel(self, tensors: Dict, B: int):
         """Launch parity check kernel."""
-        grid = (B * self.C,)
+        total = B * self.C
+        grid = ((total + self.ROWS_PER_PROG_PAR - 1) // self.ROWS_PER_PROG_PAR,)
         
         parity_per_check_kernel[grid](
             tensors['hard_dec'],
@@ -229,7 +269,9 @@ class RelayBPDecoder:
             tensors['syndrome'], tensors['check_ok'],
             B, self.C, self.V, self.E,
             self.c2v_config['BLOCK_SIZE'],
+            ROWS_PER_PROG=self.ROWS_PER_PROG_PAR,
             num_warps=self.c2v_config['num_warps'],
+            num_stages=self.c2v_config['num_stages'],
         )
     
     def _launch_init_kernel(self, tensors: Dict, B: int):
@@ -241,23 +283,40 @@ class RelayBPDecoder:
             B, self.E
         )
     
-    def _check_parity_and_select(self, tensors: Dict, B: int) -> torch.Tensor:
-        """Check parity and select best solutions."""
+    def _launch_stop_flag_kernel(self, tensors: Dict, B: int):
+        """Launch stop flag kernel."""
+        grid = (1,)  # Single program
+        
+        stop_flag_kernel[grid](
+            tensors['found_count'],
+            self.stop_nconv,
+            tensors['stop_flag'],
+            B
+        )
+    
+    def _check_parity_and_select(self, tensors: Dict, B: int):
+        """Check parity and select best solutions (device-only, no return)."""
         # Launch parity check
         self._launch_parity_check_kernel(tensors, B)
         
         # Check if all parity constraints are satisfied
-        valid_per_check = tensors['check_ok'].view(B, self.C)  # uint8
-        valid = torch.all(valid_per_check.bool(), dim=1)       # bool [B]
-        cand_w = (tensors['hard_dec'].float() * self.wj).sum(dim=1)  # [B]
-
-        better = valid & (cand_w < tensors['best_weights'])
-        tensors['best_weights'] = torch.where(better, cand_w, tensors['best_weights'])
-        tensors['best_errors'][better] = tensors['hard_dec'][better]
-        tensors['valid_solutions'] |= better
-        tensors['found_count'] += valid.to(torch.int32)
+        valid = tensors['check_ok'].view(B, self.C).all(dim=1)  # [B] bool
+        idx = torch.nonzero(valid, as_tuple=False).squeeze(1)  # [K]
         
-        return valid
+        if idx.numel() == 0:
+            return  # No valid solutions, skip weight computation
+        
+        # Only compute weights for valid indices
+        cand_w = (tensors['hard_dec'][idx].float() * self.wj).sum(dim=1)  # [K]
+        
+        better = cand_w < tensors['best_weights'][idx]
+        if better.any():
+            upd = idx[better]
+            tensors['best_weights'][upd] = cand_w[better]
+            tensors['best_errors'][upd] = tensors['hard_dec'][upd]
+            tensors['valid_solutions'][upd] = True
+        
+        tensors['found_count'] += valid.to(torch.int32)
     
     def decode(self, syndromes: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Decode syndromes using Relay-BP algorithm.
@@ -298,17 +357,19 @@ class RelayBPDecoder:
         gamma0_tensor = sample_gamma_scalar(B, self.V, self.gamma0, self.device)
         tensors['gamma'][:] = gamma0_tensor
         
-        for _ in range(self.pre_iter):
+        for t in range(self.pre_iter):
             self._launch_c2v_kernel(tensors, B)
-            self._launch_v2c_kernel(tensors, B)
-            self._launch_gamma_mix_kernel(tensors, B)
+            self._launch_v2c_fused_gamma_kernel(tensors, B)  # Fused V2C + gamma mixing
             
-            # Check parity and select solutions
-            valid = self._check_parity_and_select(tensors, B)
-            
-            # Early exit if all samples have enough solutions
-            if torch.all(tensors['found_count'] >= self.stop_nconv):
-                break
+            # Check parity and select solutions only every CHECK_EVERY iterations
+            if (t + 1) % self.CHECK_EVERY == 0:
+                self._check_parity_and_select(tensors, B)
+                self._launch_stop_flag_kernel(tensors, B)
+                if tensors['stop_flag'].item():  # One tiny sync occasionally
+                    break
+        
+        # Final parity check after pre-iterations
+        self._check_parity_and_select(tensors, B)
         
         # Relay legs (R times)
         for leg in range(self.num_sets):
@@ -317,20 +378,21 @@ class RelayBPDecoder:
             gamma_leg = sample_gamma_uniform(B, self.V, gamma_min, gamma_max, self.device, self.seed + leg)
             tensors['gamma'][:] = gamma_leg
             
-            for _ in range(self.set_max_iter):
+            for t in range(self.set_max_iter):
                 self._launch_c2v_kernel(tensors, B)
-                self._launch_v2c_kernel(tensors, B)
-                self._launch_gamma_mix_kernel(tensors, B)
+                self._launch_v2c_fused_gamma_kernel(tensors, B)  # Fused V2C + gamma mixing
                 
-                # Check parity and select solutions
-                valid = self._check_parity_and_select(tensors, B)
-                
-                # Early exit if all samples have enough solutions
-                if torch.all(tensors['found_count'] >= self.stop_nconv):
-                    break
+                # Check parity and select solutions only every CHECK_EVERY iterations
+                if (t + 1) % self.CHECK_EVERY == 0:
+                    self._check_parity_and_select(tensors, B)
+                    self._launch_stop_flag_kernel(tensors, B)
+                    if tensors['stop_flag'].item():  # One tiny sync occasionally
+                        break
             
-            # Early exit if all samples have enough solutions
-            if torch.all(tensors['found_count'] >= self.stop_nconv):
+            # Final parity check and stop flag after each leg
+            self._check_parity_and_select(tensors, B)
+            self._launch_stop_flag_kernel(tensors, B)
+            if tensors['stop_flag'].item():  # One tiny sync occasionally
                 break
         
         # Prepare output
