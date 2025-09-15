@@ -7,7 +7,7 @@ import torch
 from scipy.sparse import csr_matrix
 
 # Environment controls for test configuration
-INCLUDE_OBS_GPU = os.getenv("RELAY_INCLUDE_OBS_GPU", "0") != "0"
+INCLUDE_OBS_GPU = os.getenv("RELAY_INCLUDE_OBS_GPU", "1") != "0"
 FIXED_ITERS = os.getenv("RELAY_PERF_FIXED_ITERS", "1") != "0"
 GPU_MSG_DTYPE = os.getenv("RELAY_GPU_MSG_DTYPE", "fp32")  # "fp32" or "fp16"
 B_LIST = [int(x) for x in os.getenv("RELAY_B_LIST", "64,128,256,512,1024").split(",")]
@@ -228,10 +228,10 @@ def _warmup_triton(decoder, S_dev, n_warm=2):
 
 
 def _build_torch_obs(O_csr):
-    """Build O as torch.sparse_csr on GPU with int32 data=1."""
+    """Build O as torch.sparse_csr on GPU with float32 data (for spmm)."""
     indptr = torch.tensor(O_csr.indptr, dtype=torch.int32, device="cuda")
     indices = torch.tensor(O_csr.indices, dtype=torch.int32, device="cuda")
-    data = torch.ones(O_csr.nnz, dtype=torch.int32, device="cuda")
+    data = torch.ones(O_csr.nnz, dtype=torch.float32, device="cuda")
     return torch.sparse_csr_tensor(indptr, indices, data, size=O_csr.shape, device="cuda")
 
 
@@ -240,8 +240,9 @@ def _gpu_decode_and_obs(gpu_decoder, S_dev, O_torch_csr=None):
     out = gpu_decoder.decode(S_dev)  # out["errors"]: [B,V] u8
     if O_torch_csr is not None:
         # (O,V) @ (V,B) -> (O,B), then T -> (B,O), mod 2
-        E_int = out["errors"].to(torch.int32)      # [B,V]
-        obs = (O_torch_csr @ E_int.T).T & 1        # [B,O] uint8 after cast-back if you want
+        E_f32 = out["errors"].to(torch.float32)       # [B,V] float for spmm
+        obs_sum = (O_torch_csr @ E_f32.T).T            # [B,O] float32
+        obs = (obs_sum.to(torch.int32) & 1)            # reduce mod 2 if needed
     return out
 
 
@@ -299,6 +300,7 @@ def test_perf_real_circuit_speed():
     
     # Create decoders with consistent parameters
     rust_runner = make_rust_observable_runner_sinter_like(H, p, O)
+    rust_dec = make_rust_decoder_sinter_like(H, p, fixed_iters=FIXED_ITERS)
     gpu = make_triton_decoder_sinter_like(H, p, device="cuda",
                                           msg_dtype=GPU_MSG_DTYPE,
                                           fixed_iters=FIXED_ITERS)
@@ -313,16 +315,21 @@ def test_perf_real_circuit_speed():
 
         _warmup_triton(gpu, S_dev, n_warm=2)
 
-        # CPU: batch+parallel with observables (sinter-like)
-        t_rust_med, t_rust_p99 = time_cpu_rust_runner(rust_runner, S, repeats=5)
-
-        # GPU: decode (+ optional observables) with CUDA events
-        t_gpu_med, t_gpu_p99 = _cuda_time(lambda: _gpu_decode_and_obs(gpu, S_dev, O_torch), repeats=5)
+        if INCLUDE_OBS_GPU:
+            # CPU: batch+parallel with observables (sinter-like)
+            t_rust_med, t_rust_p99 = time_cpu_rust_runner(rust_runner, S, repeats=5)
+            # GPU: decode (+ observables) with CUDA events
+            t_gpu_med, t_gpu_p99 = _cuda_time(lambda: _gpu_decode_and_obs(gpu, S_dev, O_torch), repeats=5)
+        else:
+            # CPU: decode-only (no observables) for a fair compare
+            t_rust_med, t_rust_p99 = time_cpu_rust_decode(rust_dec, S, repeats=5)
+            # GPU: decode-only
+            t_gpu_med, t_gpu_p99 = _cuda_time(lambda: gpu.decode(S_dev), repeats=5)
 
         # Sanity check
         assert t_rust_med > 0 and t_gpu_med > 0, "Non-positive timing indicates a measurement bug."
 
-        print(f"[perf] B={B:4d} | Rust(obs): {t_rust_med*1e3:8.2f} ms ({B/t_rust_med:8.1f}/s) | "
+        print(f"[perf] B={B:4d} | Rust({('obs' if INCLUDE_OBS_GPU else 'dec')}): {t_rust_med*1e3:8.2f} ms ({B/t_rust_med:8.1f}/s) | "
               f"Triton: {t_gpu_med*1e3:8.2f} ms ({B/t_gpu_med:8.1f}/s) | x{t_rust_med/t_gpu_med:0.2f}")
 
 
