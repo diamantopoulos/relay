@@ -132,19 +132,11 @@ class RelayBPPaperStudy:
     def run_study(self, shots: int = 1000):
         """Run the complete study."""
         
-        print("Starting Relay-BP Paper Study...")
+        print("Starting Plain-BP Paper Study...")
         print("=" * 50)
         
         configs = self.define_parameter_grid()
         
-        #for i, config in enumerate(configs):
-        #    print(f"\n[{i+1}/{len(configs)}] {config['name']}")
-       #     result = self.run_single_config(config, shots)
-       #     if result is not None:
-       #         self.results.append(result)
-        
-        #print(f"\nStudy completed! Collected {len(self.results)} results.")
-
         # Run plain BP sweep (paper baseline)
         bp_configs = self.define_plain_bp_grid()
         for i, config in enumerate(bp_configs):
@@ -154,6 +146,16 @@ class RelayBPPaperStudy:
                 self.results.append(result)
         
         print(f"\nPlain BP Study completed! Collected {len(self.results)} results.")
+
+        print("Starting Relay-BP Paper Study...")
+
+        for i, config in enumerate(configs):
+            print(f"\n[{i+1}/{len(configs)}] {config['name']}")
+            result = self.run_single_config(config, shots)
+            if result is not None:
+                self.results.append(result)
+        
+        print(f"\nStudy completed! Collected {len(self.results)} results.")
 
         # Save results
         self.save_results()
