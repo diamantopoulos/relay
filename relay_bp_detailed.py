@@ -110,6 +110,12 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     
     # Check observables count
     print(f"DEM stats: detectors={dem.num_detectors}, observables={dem.num_observables}")
+    print(f"Using rounds={rounds} as the number of cycles for per-cycle LER conversion")
+    # Soft filename sanity check that circuit tag encodes distance/rounds
+    if isinstance(circuit, str):
+        tag_ok = f"_{rounds}_" in circuit
+        if not tag_ok:
+            print(f"[warn] Circuit name '{circuit}' does not obviously encode rounds={rounds}.")
     assert dem.num_observables > 0, (
         "No observables after basis filtering. "
         "Use XZ (no filter) to match the paper."
@@ -118,7 +124,7 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     # Create check matrices
     check_matrices = CheckMatrices.from_dem(dem)
     
-    # Create Relay-BP decoder
+    # Create Relay-BP decoder (CPU). Use normalized min-sum alpha if provided.
     decoder = relay_bp.RelayDecoderF64(
         check_matrices.check_matrix,
         error_priors=check_matrices.error_priors,
@@ -139,10 +145,10 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
         include_decode_result=True,  # Enable detailed results
     )
     
-    # Convert legs → BP iterations (paper's x-axis) - will be updated after error collection
-    avg_legs = 0.0  # Will be updated
-    avg_bp_iterations = 0.0  # Will be updated
-    
+    # BP iteration stats (paper's x-axis) and debug legs reporting
+    avg_bp_iterations = 0.0
+    avg_legs = 0.0
+    legs_all = []
     # Error-targeted collection (prevents LER=0 and stabilizes estimates)
     # Apply heuristic to avoid stopping too early at low LER
     heuristic_max = 100 * target_errors * rounds
@@ -151,7 +157,7 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     total_shots = 0
     total_errors = 0
     bp_iters_all = []
-    legs_all = []
+    
     
     sampler = circuit_obj.compile_detector_sampler()
     print(f"Collecting until {target_errors} errors or {max_shots} shots...")
@@ -165,17 +171,23 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
         
         # Get detailed results for iteration counting
         det = observable_decoder.decode_detailed_batch(synd_u8, parallel=parallel)
-        bp_iters_all.extend([r.iterations for r in det])  # r.iterations = BP iterations
-        # Convert BP iterations to legs for display
-        legs_all.extend(1.0 + np.maximum(0.0, (np.array([r.iterations for r in det]) - pre_iter) / set_max_iter))
+        iters_arr = np.array([r.iterations for r in det], dtype=float)
+        bp_iters_all.extend(iters_arr.tolist())  # r.iterations = BP iterations
+        # Derive legs only for reporting/debug (not for avg iteration computation)
+        legs_all.extend(1.0 + np.maximum(0.0, (iters_arr - pre_iter) / set_max_iter))
         
-        # Get predictions for error counting
-        pred = observable_decoder.decode_observables_batch(synd_u8, parallel=parallel)
+        # Get predictions for error counting using detailed path to ensure any frames are applied
+        obs_det = observable_decoder.decode_observables_detailed_batch(synd_u8, parallel=parallel)
+        # Extract observables from results list into array
+        pred = np.stack([r.observables for r in obs_det], axis=0)
+        pred = pred.astype(np.uint8, copy=False)
         
         # Count errors
         assert pred.shape == obs.shape and pred.shape[1] > 0, \
             f"Bad shapes: pred{pred.shape} vs obs{obs.shape}"
-        errs = (pred != obs.astype(int)).any(axis=1).sum()
+        obs_u8 = obs.astype(np.uint8, copy=False)
+        # Count failure if any logical observable differs (mod 2)
+        errs = (np.bitwise_xor(pred, obs_u8).any(axis=1)).sum()
         total_errors += int(errs)
         total_shots += batch
         
@@ -191,11 +203,14 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     
     # Calculate per-cycle logical error rate (as per paper)
     per_cycle_logical_error_rate = 1 - (1 - logical_error_rate) ** (1 / rounds)
+    # Optional alt check: if rounds had been half-cycles, this would be different
+    per_cycle_ler_half_rounds = 1 - (1 - logical_error_rate) ** (1 / max(1, 2 * rounds))
     
     # Calculate averages from collected data
     if bp_iters_all:
         avg_bp_iterations = float(np.mean(bp_iters_all))
-        avg_legs = float(np.mean(legs_all))
+        if legs_all:
+            avg_legs = float(np.mean(legs_all))
     else:
         avg_bp_iterations = 0.0
         avg_legs = 0.0
@@ -214,7 +229,7 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
         'logical_error_rate': float(logical_error_rate),
         'per_cycle_logical_error_rate': float(per_cycle_logical_error_rate),
         'avg_bp_iterations': float(avg_bp_iterations),  # Paper's x-axis
-        'avg_legs': float(avg_legs),  # For debugging
+        'avg_legs': float(avg_legs),  # For debugging/reporting only
         'config': {
             'gamma0': float(gamma0),
             'num_sets': int(num_sets),
@@ -229,8 +244,107 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     
     if runtime_per_shot is not None:
         results_data['runtime_per_shot_ns'] = float(runtime_per_shot)
+    # Attach optional diagnostic to help verify cycle root choice
+    results_data['per_cycle_ler_alt_half_rounds'] = float(per_cycle_ler_half_rounds)
     
     return results_data
+
+
+def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
+                            max_iter=200, alpha=None, target_errors=20, batch=2000,
+                            max_shots=1000000, parallel=True, measure_time=True):
+    """Run plain min-sum BP (no relay, no memory) with detailed counting."""
+
+    try:
+        random.seed(0)
+        np.random.seed(0)
+        stim.set_global_seed(0)
+    except Exception:
+        pass
+
+    circuit_obj = get_test_circuit(
+        circuit=circuit,
+        distance=distance,
+        rounds=rounds,
+        error_rate=error_rate,
+    )
+
+    if basis == 'z':
+        circuit_obj = filter_detectors_by_basis(circuit_obj, "Z")
+
+    dem = circuit_obj.detector_error_model()
+    print(f"DEM stats: detectors={dem.num_detectors}, observables={dem.num_observables}")
+    print(f"Using rounds={rounds} as the number of cycles for per-cycle LER conversion")
+    assert dem.num_observables > 0
+
+    check_matrices = CheckMatrices.from_dem(dem)
+
+    # Build plain min-sum decoder (no relay, no memory)
+    kwargs = dict(
+        error_priors=check_matrices.error_priors,
+        max_iter=max_iter,
+        alpha=None if (alpha == 0.0) else alpha,
+        gamma0=None,
+    )
+    decoder = relay_bp.MinSumBPDecoderF64(check_matrices.check_matrix, **kwargs)
+    observable_decoder = relay_bp.ObservableDecoderRunner(
+        decoder,
+        check_matrices.observables_matrix,
+        include_decode_result=True,
+    )
+
+    total_shots = 0
+    total_errors = 0
+    iters_all = []
+
+    sampler = circuit_obj.compile_detector_sampler()
+    print(f"Collecting until {target_errors} errors or {max_shots} shots...")
+    start_time = time.time() if measure_time else None
+
+    while total_errors < target_errors and total_shots < max_shots:
+        synd, obs = sampler.sample(batch, separate_observables=True)
+        synd_u8 = synd.astype(np.uint8)
+
+        # Detailed decoding to get iterations and predicted observables
+        det = observable_decoder.decode_detailed_batch(synd_u8, parallel=parallel)
+        iters_arr = np.array([r.iterations for r in det], dtype=float)
+        iters_all.extend(iters_arr.tolist())
+
+        obs_det = observable_decoder.decode_observables_detailed_batch(synd_u8, parallel=parallel)
+        pred = np.stack([r.observables for r in obs_det], axis=0).astype(np.uint8, copy=False)
+        obs_u8 = obs.astype(np.uint8, copy=False)
+        errs = (np.bitwise_xor(pred, obs_u8).any(axis=1)).sum()
+        total_errors += int(errs)
+        total_shots += batch
+        print(f"  Collected {total_shots} shots, {total_errors} errors (batch errors: {errs})")
+
+    ler = total_errors / total_shots if total_shots > 0 else 0.0
+    per_cycle_ler = 1 - (1 - ler) ** (1 / rounds)
+    avg_bp_iterations = float(np.mean(iters_all)) if iters_all else 0.0
+
+    runtime_per_shot = None
+    end_time = time.time() if measure_time else None
+    if measure_time and start_time and end_time and total_shots > 0:
+        runtime_per_shot = (end_time - start_time) * 1e9 / total_shots
+
+    out = {
+        'shots': int(total_shots),
+        'logical_errors': int(total_errors),
+        'logical_error_rate': float(ler),
+        'per_cycle_logical_error_rate': float(per_cycle_ler),
+        'avg_bp_iterations': float(avg_bp_iterations),
+        'config': {
+            'circuit': str(circuit),
+            'distance': int(distance),
+            'rounds': int(rounds),
+            'error_rate': float(error_rate),
+            'max_iter': int(max_iter),
+            'alpha': None if alpha is None else float(alpha),
+        }
+    }
+    if runtime_per_shot is not None:
+        out['runtime_per_shot_ns'] = float(runtime_per_shot)
+    return out
 
 
 def main():

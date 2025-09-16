@@ -10,7 +10,7 @@ from scipy.sparse import csr_matrix
 INCLUDE_OBS_GPU = os.getenv("RELAY_INCLUDE_OBS_GPU", "1") != "0"
 FIXED_ITERS = os.getenv("RELAY_PERF_FIXED_ITERS", "1") != "0"
 GPU_MSG_DTYPE = os.getenv("RELAY_GPU_MSG_DTYPE", "fp32")  # "fp32" or "fp16"
-B_LIST = [int(x) for x in os.getenv("RELAY_B_LIST", "64,128,256,512,1024").split(",")]
+B_LIST = [int(x) for x in os.getenv("RELAY_B_LIST", "1,64,128,256,512,1024").split(",")]
 
 # Pin Rust threads for stability (if relay_bp uses Rayon)
 os.environ.setdefault("RAYON_NUM_THREADS", str(os.cpu_count()))
@@ -203,7 +203,28 @@ def make_triton_decoder_sinter_like(H, p, device="cuda", msg_dtype="fp32", fixed
         device=device,
         seed=1234,
         bitpack_output=False,
+        mode="throughput",
     )
+
+def make_triton_decoder_realtime(H, p, device="cuda", msg_dtype="fp16"):
+    return RelayBPDecoder(
+        H_csr=H,
+        error_priors=p,
+        gamma0=0.1,
+        pre_iter=80,
+        num_sets=60,
+        set_max_iter=60,
+        gamma_dist_interval=(-0.24, 0.66),
+        stop_nconv=1_000_000_000,  # fixed iters
+        normalized_min_sum_alpha=0.90,
+        offset_min_sum_beta=None,
+        dtype_messages=msg_dtype,
+        device=device,
+        seed=1234,
+        bitpack_output=False,
+        mode="realtime",
+    )
+
 
 def _cuda_time(fn, repeats=5):
     """CUDA event timing for stable GPU measurements."""
@@ -361,3 +382,41 @@ def test_perf_real_circuit_latency():
         print(f"[lat] B={B:2d} | CPU median {med_cpu*1e3:7.2f} ms  p99 {p99_cpu*1e3:7.2f} ms  || "
               f"GPU median {med_gpu*1e3:7.2f} ms  p99 {p99_gpu*1e3:7.2f} ms  | "
               f"x{med_cpu/med_gpu:0.2f}")
+
+
+def test_perf_realtime_latency():
+    H, p, O = build_real_circuit_H_p(
+        circuit="bicycle_bivariate_144_12_12_memory_Z",
+        basis="z", distance=12, rounds=12, error_rate=0.003,
+    )
+    rust = make_rust_decoder_sinter_like(H, p, fixed_iters=True)
+    gpu  = make_triton_decoder_realtime(H, p, device="cuda", msg_dtype=os.getenv("RELAY_RT_MSG_DTYPE", "fp16"))
+
+    # warm worker
+    s_dummy = torch.zeros((1, H.shape[0]), dtype=torch.uint8, device="cuda")
+    _ = gpu.decode_rt(s_dummy)
+
+    times_cpu, times_gpu = [], []
+    for _ in range(200):
+        _, S = sample_batch_errors_and_syndromes(H, p, B=1, seed=np.random.randint(1<<31))
+        # CPU
+        t0 = time.perf_counter()
+        rust.decode(S[0])
+        times_cpu.append(time.perf_counter() - t0)
+        # GPU
+        S_dev = torch.tensor(S, dtype=torch.uint8, device="cuda")
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True); end = torch.cuda.Event(enable_timing=True)
+        start.record(); _ = gpu.decode_rt(S_dev); end.record()
+        torch.cuda.synchronize()
+        times_gpu.append(start.elapsed_time(end)/1e3)
+
+    def stats(xs):
+        xs = np.array(xs)
+        return float(np.median(xs)), float(np.percentile(xs, 99.0))
+
+    med_cpu, p99_cpu = stats(times_cpu)
+    med_gpu, p99_gpu = stats(times_gpu)
+    print(f"[rt] p50 CPU {med_cpu*1e3:7.2f} ms  p99 {p99_cpu*1e3:7.2f} ms  || "
+          f"GPU p50 {med_gpu*1e3:7.2f} ms  p99 {p99_gpu*1e3:7.2f} ms  | "
+          f"x{med_cpu/med_gpu:0.2f} (p50), x{p99_cpu/p99_gpu:0.2f} (p99)")

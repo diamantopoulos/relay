@@ -14,11 +14,14 @@ import torch
 import numpy as np
 from scipy.sparse import csr_matrix
 from typing import Dict, Optional, Tuple, Union
+import os
 
 from .graph import CSRGraph
 from .kernels import (
     c2v_min_sum_kernel, v2c_and_marginals_kernel, v2c_and_marginals_fused_gamma_kernel,
-    gamma_mix_kernel, parity_per_check_kernel, init_messages_kernel, stop_flag_kernel, get_autotuner
+    gamma_mix_kernel, parity_per_check_kernel, init_messages_kernel, stop_flag_kernel, get_autotuner,
+    be_to_eb_kernel, eb_to_be_kernel, c2v_min_sum_btile_kernel, v2c_and_gamma_btile_kernel,
+    relay_decode_persistent_kernel,
 )
 from .utils import (
     compute_log_prior_ratios, compute_decoding_weights, sample_gamma_uniform,
@@ -49,7 +52,8 @@ class RelayBPDecoder:
         dtype_messages: str = "fp16",  # Default to fp16 for better performance
         device: str = "cuda",
         seed: int = 1234,
-        bitpack_output: bool = False
+        bitpack_output: bool = False,
+        mode: str = "default",  # "default" or "throughput"
     ):
         """Initialize Relay-BP decoder.
         
@@ -97,6 +101,7 @@ class RelayBPDecoder:
         self.device = device
         self.seed = seed
         self.bitpack_output = bitpack_output
+        self.mode = mode
         
         # Set up device
         if device == "cuda" and not torch.cuda.is_available():
@@ -154,6 +159,14 @@ class RelayBPDecoder:
         self.ROWS_PER_PROG_C2V = 8  # Number of rows per C2V program
         self.ROWS_PER_PROG_V2C = 8  # Number of rows per V2C program
         self.ROWS_PER_PROG_PAR = 8  # Number of rows per parity program
+
+        # Realtime env toggles
+        self.rt_Q = int(os.getenv("RELAY_RT_QUEUE", "64"))
+        self.rt_check_every = int(os.getenv("RELAY_RT_CHECK_EVERY", "8"))
+        self.rt_msg_dtype = os.getenv("RELAY_RT_MSG_DTYPE", "fp16")
+        self.rt_num_warps = int(os.getenv("RELAY_RT_PERSIST_WARPS", "8"))
+        self.rt_block_size = int(os.getenv("RELAY_RT_BLOCK_SIZE", "128"))
+        self._rt_worker_launched = False
     
     def _allocate_device_tensors(self, B: int):
         """Allocate device tensors for batch size B."""
@@ -186,9 +199,131 @@ class RelayBPDecoder:
             # Device-driven early exit
             'stop_flag': torch.zeros(1, dtype=torch.uint8, device=self.device),
         }
-        
+        if self.mode == "throughput":
+            # [E,B] transposed message buffers for BTILE kernels
+            tensors['muT'] = torch.zeros(self.E, B, dtype=self.msg_dtype, device=self.device)
+            tensors['nuT'] = torch.zeros(self.E, B, dtype=self.msg_dtype, device=self.device)
         self._device_tensors[B] = tensors
         return tensors
+
+    def _allocate_realtime_state(self):
+        if hasattr(self, "_rt_state_allocated") and self._rt_state_allocated:
+            return
+        Q = self.rt_Q
+        # queues
+        self.rt_syndromes = torch.zeros(Q, self.C, dtype=torch.uint8, device=self.device)
+        self.rt_errors = torch.zeros(Q, self.V, dtype=torch.uint8, device=self.device)
+        self.rt_weights = torch.zeros(Q, dtype=torch.float32, device=self.device)
+        self.rt_valid = torch.zeros(Q, dtype=torch.uint8, device=self.device)
+        self.rt_slot_state = torch.zeros(Q, dtype=torch.int32, device=self.device)  # 0=EMPTY,1=READY,2=DONE
+        # state B=1
+        msg_dtype = torch.float16 if self.rt_msg_dtype == "fp16" else torch.float32
+        self.rt_mu = torch.zeros(self.E, dtype=msg_dtype, device=self.device)
+        self.rt_nu = torch.zeros(self.E, dtype=msg_dtype, device=self.device)
+        self.rt_lambda = torch.zeros(self.V, dtype=torch.float32, device=self.device)
+        self.rt_M = torch.zeros(self.V, dtype=torch.float32, device=self.device)
+        self.rt_gamma = torch.zeros(self.V, dtype=torch.float32, device=self.device)
+        self.rt_hard_dec = torch.zeros(self.V, dtype=torch.uint8, device=self.device)
+        self.rt_check_ok = torch.zeros(self.C, dtype=torch.uint8, device=self.device)
+        self._rt_head = 0
+        self._rt_state_allocated = True
+
+    def _ensure_worker(self):
+        if self._rt_worker_launched:
+            return
+        self._allocate_realtime_state()
+        # launch persistent worker
+        grid = (max(self.C // 16, 1),)
+        msg_is_fp16 = (self.rt_mu.dtype == torch.float16)
+        relay_decode_persistent_kernel[grid](
+            self.graph.chk_ptr, self.graph.chk_edges, self.graph.var_ptr, self.graph.var_edges, self.graph.edge_var, self.graph.edge_chk,
+            self.rt_mu, self.rt_nu, self.rt_lambda, self.rt_M, self.rt_gamma, self.rt_hard_dec, self.rt_check_ok,
+            self.lambda0,
+            self.rt_syndromes, self.rt_errors, self.rt_weights, self.rt_valid, self.rt_slot_state,
+            self.rt_Q, self.C, self.V, self.E,
+            self.normalized_min_sum_alpha or 0.0, self.offset_min_sum_beta or 0.0,
+            self.pre_iter, self.set_max_iter, self.num_sets, self.rt_check_every,
+            use_alpha=(self.normalized_min_sum_alpha is not None),
+            use_beta=(self.offset_min_sum_beta is not None),
+            msg_is_fp16=msg_is_fp16,
+            BLOCK_SIZE=self.rt_block_size,
+            ROWS_PER_CHK=8,
+            ROWS_PER_VAR=8,
+            MAX_STEPS=1000000,
+            num_warps=self.rt_num_warps,
+            num_stages=2,
+            )
+        self._rt_worker_launched = True
+
+    def decode_rt(self, syndrome: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Realtime single-sample decode using persistent worker.
+        syndrome: [1, C] uint8 on CUDA device
+        """
+        assert self.mode == "realtime", "Use mode='realtime' to call decode_rt()"
+        if syndrome.device != torch.device(self.device):
+            syndrome = syndrome.to(self.device)
+        if syndrome.ndim == 1:
+            syndrome = syndrome.view(1, -1)
+        assert syndrome.shape == (1, self.C)
+        self._ensure_worker()
+        Q = self.rt_Q
+        slot = self._rt_head % Q
+        # ensure slot empty
+        # write syndrome
+        self.rt_syndromes[slot].copy_(syndrome[0])
+        # set READY
+        self.rt_slot_state[slot] = 1
+        # wait busy-loop (simple polling)
+        # WARNING: simple implementation; can be replaced by event-based
+        while True:
+            state = int(self.rt_slot_state[slot].item())
+            if state == 2:
+                break
+            torch.cuda._sleep(1000)  # ~1us
+        # read outputs
+        errors = self.rt_errors[slot:slot+1]
+        weights = self.rt_weights[slot:slot+1]
+        valid = self.rt_valid[slot:slot+1].to(torch.bool)
+        # reset slot
+        self.rt_slot_state[slot] = 0
+        self._rt_head += 1
+        return {"errors": errors, "weights": weights, "valid_mask": valid}
+    
+    # --- Transpose helpers ---
+    def _be_to_eb(self, src_be: torch.Tensor, dst_eb: torch.Tensor, B: int):
+        grid = (self.E,)
+        msg_is_fp16 = (self.msg_dtype == torch.float16)
+        be_to_eb_kernel[grid](
+            src_be, dst_eb, B, self.E,
+            msg_is_fp16, BTILE=16,
+        )
+
+    def _eb_to_be(self, src_eb: torch.Tensor, dst_be: torch.Tensor, B: int):
+        grid = (self.E,)
+        msg_is_fp16 = (self.msg_dtype == torch.float16)
+        eb_to_be_kernel[grid](
+            src_eb, dst_be, B, self.E,
+            msg_is_fp16, BTILE=16,
+        )
+
+    def _launch_c2v_btile(self, tensors: Dict, B: int):
+        grid = (self.C, (B + 16 - 1) // 16)
+        alpha = self.normalized_min_sum_alpha or 0.0
+        beta = self.offset_min_sum_beta or 0.0
+        use_alpha = self.normalized_min_sum_alpha is not None
+        use_beta = self.offset_min_sum_beta is not None
+        msg_is_fp16 = (self.msg_dtype == torch.float16)
+        c2v_min_sum_btile_kernel[grid](
+            tensors['muT'], tensors['nuT'],
+            self.graph.chk_ptr, self.graph.chk_edges,
+            tensors['syndrome'], B, self.C, self.E,
+            alpha, beta, use_alpha, use_beta,
+            msg_is_fp16,
+            self.c2v_config['BLOCK_SIZE'],
+            BTILE=16,
+            num_warps=self.c2v_config['num_warps'],
+            num_stages=self.c2v_config['num_stages'],
+        )
     
     def _launch_c2v_kernel(self, tensors: Dict, B: int):
         """Launch check-to-variable kernel."""
@@ -297,6 +432,23 @@ class RelayBPDecoder:
             B
         )
     
+    def _launch_v2c_btile(self, tensors: Dict, B: int, write_hard: bool):
+        grid = (self.V, (B + 16 - 1) // 16)
+        msg_is_fp16 = (self.msg_dtype == torch.float16)
+        v2c_and_gamma_btile_kernel[grid](
+            tensors['nuT'], tensors['muT'],
+            self.graph.var_ptr, self.graph.var_edges,
+            tensors['lambda_'], self.lambda0, tensors['gamma'],
+            tensors['M'], tensors['hard_dec'],
+            B, self.V, self.E,
+            msg_is_fp16,
+            self.v2c_config['BLOCK_SIZE'],
+            BTILE=16,
+            WRITE_HARD=write_hard,
+            num_warps=self.v2c_config['num_warps'],
+            num_stages=self.v2c_config['num_stages'],
+        )
+    
     def _check_parity_and_select(self, tensors: Dict, B: int):
         """Check parity and select best solutions (device-only, no return)."""
         # Launch parity check
@@ -360,15 +512,25 @@ class RelayBPDecoder:
         gamma0_tensor = sample_gamma_scalar(B, self.V, self.gamma0, self.device)
         tensors['gamma'][:] = gamma0_tensor
         
+        if self.mode == "throughput":
+            # transpose mu/nu to [E,B] once
+            self._be_to_eb(tensors['mu'], tensors['muT'], B)
+            self._be_to_eb(tensors['nu'], tensors['nuT'], B)
+
         for t in range(self.pre_iter):
-            self._launch_c2v_kernel(tensors, B)                  # produces ν
-            self._launch_v2c_fused_gamma_kernel(tensors, B)      # V2C + gamma mixing (no atomics)
-            
-            # Check parity and select solutions only every CHECK_EVERY iterations
+            if self.mode == "throughput":
+                # BTILE C2V and V2C fully in [E,B]
+                self._launch_c2v_btile(tensors, B)
+                self._launch_v2c_btile(tensors, B, write_hard=((t+1) % self.CHECK_EVERY == 0))
+            else:
+                self._launch_c2v_kernel(tensors, B)
+                self._launch_v2c_fused_gamma_kernel(tensors, B)
+
             if (t + 1) % self.CHECK_EVERY == 0:
+                # For parity path, we need hard_dec updated (done in v2c btile when write_hard=True)
                 self._check_parity_and_select(tensors, B)
                 self._launch_stop_flag_kernel(tensors, B)
-                if tensors['stop_flag'].item():  # One tiny sync occasionally
+                if tensors['stop_flag'].item():
                     break
         
         # Final parity check after pre-iterations

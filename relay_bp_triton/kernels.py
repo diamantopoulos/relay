@@ -551,6 +551,534 @@ def edge_update_mu_kernel(
         tl.store(mu + b*E + e, mu_be, mask=m)
 
 
+@triton.jit
+def be_to_eb_kernel(
+    src_be, dst_eb,
+    B, E,
+    msg_is_fp16: tl.constexpr,
+    BTILE: tl.constexpr,
+):
+    """Transpose messages from [B,E] to [E,B] in BTILE chunks of B."""
+    e = tl.program_id(axis=0)
+    if e >= E:
+        return
+    b0 = 0
+    while b0 < B:
+        bs = b0 + tl.arange(0, BTILE)
+        m = bs < B
+        if msg_is_fp16:
+            vals = tl.load(src_be + bs * E + e, mask=m, other=0).to(tl.float16)
+            tl.store(dst_eb + e * B + bs, vals, mask=m)
+        else:
+            vals = tl.load(src_be + bs * E + e, mask=m, other=0.0)
+            tl.store(dst_eb + e * B + bs, vals, mask=m)
+        b0 += BTILE
+
+
+@triton.jit
+def eb_to_be_kernel(
+    src_eb, dst_be,
+    B, E,
+    msg_is_fp16: tl.constexpr,
+    BTILE: tl.constexpr,
+):
+    """Transpose messages from [E,B] to [B,E] in BTILE chunks of B."""
+    e = tl.program_id(axis=0)
+    if e >= E:
+        return
+    b0 = 0
+    while b0 < B:
+        bs = b0 + tl.arange(0, BTILE)
+        m = bs < B
+        vals = tl.load(src_eb + e * B + bs, mask=m, other=0)
+        if msg_is_fp16:
+            tl.store(dst_be + bs * E + e, vals.to(tl.float16), mask=m)
+        else:
+            tl.store(dst_be + bs * E + e, vals, mask=m)
+        b0 += BTILE
+
+
+@triton.jit
+def c2v_min_sum_btile_kernel(
+    muT, nuT,                 # [E,B]
+    chk_ptr, chk_edges,       # CSR over checks -> edge IDs
+    syndrome,                 # [B,C] (uint8)
+    B, C, E,
+    alpha, beta,
+    use_alpha: tl.constexpr, use_beta: tl.constexpr,
+    msg_is_fp16: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BTILE: tl.constexpr,
+):
+    """Check-to-variable min-sum over [E,B] layout, vectorized across BTILE batch lanes.
+    Each program processes one check row i and updates all its edges' nuT[:, b:b+BTILE]."""
+    i = tl.program_id(axis=0)
+    btile_id = tl.program_id(axis=1)
+    if i >= C:
+        return
+    b0 = btile_id * BTILE
+    bs = b0 + tl.arange(0, BTILE)
+    mb = bs < B
+
+    row_start = tl.load(chk_ptr + i)
+    row_end   = tl.load(chk_ptr + i + 1)
+    deg = row_end - row_start
+    if deg <= 0:
+        return
+
+    # Accumulators per batch lane
+    neg_parity = tl.zeros((BTILE,), dtype=tl.int32)
+    min1 = tl.full((BTILE,), 1e30, dtype=tl.float32)
+    min2 = tl.full((BTILE,), 1e30, dtype=tl.float32)
+
+    # PASS 1: compute min1/min2 and parity per batch lane
+    tile = row_start
+    while tile < row_end:
+        offs = tile + tl.arange(0, BLOCK_SIZE)
+        mrow = offs < row_end
+        evec = tl.load(chk_edges + offs, mask=mrow, other=0)             # [BLOCK_SIZE]
+        # Build 2D mask and gather mu over edges×BTILE
+        mask2d = (mrow[:, None]) & (mb[None, :])
+        mu_tile = tl.load(muT + (evec[:, None]) * B + bs[None, :], mask=mask2d, other=0.0)  # [BLOCK_SIZE, BTILE]
+        neg_parity += tl.sum((mu_tile < 0.0) & mask2d, axis=0).to(tl.int32)
+        a = tl.abs(mu_tile.to(tl.float32))
+        a = tl.where(mask2d, a, 1e30)
+        # min1 over edges
+        min1_t = tl.min(a, axis=0)
+        # min2: mask min1 entries, then min again
+        a2 = tl.where(a == min1_t, 1e30, a)
+        min2_t = tl.min(a2, axis=0)
+        # merge with running min1/min2
+        better1 = min1_t < min1
+        min2 = tl.where(better1, tl.minimum(min1, min2_t), tl.minimum(min2, min1_t))
+        min1 = tl.where(better1, min1_t, min1)
+        tile += BLOCK_SIZE
+
+    deg_is_one = (deg == 1)
+    syn = tl.load(syndrome + bs * C + i, mask=mb, other=0).to(tl.int32) & 1
+    par_bit = ((neg_parity & 1) ^ syn)
+    sign_prod = tl.where(par_bit == 0, 1.0, -1.0)
+
+    # PASS 2: compute and store nu over edges×BTILE
+    tile = row_start
+    while tile < row_end:
+        offs = tile + tl.arange(0, BLOCK_SIZE)
+        mrow = offs < row_end
+        evec = tl.load(chk_edges + offs, mask=mrow, other=0)
+        mask2d = (mrow[:, None]) & (mb[None, :])
+        mu_tile = tl.load(muT + (evec[:, None]) * B + bs[None, :], mask=mask2d, other=0.0)
+        sgn = tl.where(mu_tile >= 0.0, 1.0, -1.0)
+        # Identify min1 lanes per edge×batch
+        a = tl.abs(mu_tile.to(tl.float32))
+        a_mask = tl.where(mask2d, a, 1e30)
+        is_min1 = a_mask == min1[None, :]
+        out_mag = tl.where(is_min1, min2[None, :], min1[None, :])
+        out_mag = tl.where(deg_is_one, 0.0, out_mag)
+        if use_alpha:
+            out_mag = alpha * out_mag
+        if use_beta:
+            out_mag = tl.maximum(out_mag - beta, 0.0)
+        nu_tile = (sign_prod[None, :] * sgn) * out_mag
+        if msg_is_fp16:
+            tl.store(nuT + (evec[:, None]) * B + bs[None, :], nu_tile.to(tl.float16), mask=mask2d)
+        else:
+            tl.store(nuT + (evec[:, None]) * B + bs[None, :], nu_tile, mask=mask2d)
+        tile += BLOCK_SIZE
+
+
+@triton.jit
+def v2c_and_gamma_btile_kernel(
+    nuT, muT,                 # [E,B]
+    var_ptr, var_edges,       # CSR over vars -> edge IDs
+    lam, lam0, gamma,         # [B,V], [V], [B,V]
+    M, hard_dec,              # [B,V], [B,V]
+    B, V, E,
+    msg_is_fp16: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BTILE: tl.constexpr,
+    WRITE_HARD: tl.constexpr,
+):
+    """Variable-to-check + gamma mixing on [E,B] layout, vectorized across BTILE.
+    For each variable j and batch tile bs, compute sum_nu, M, lambda update, and write muT.
+    """
+    j = tl.program_id(axis=0)
+    btile_id = tl.program_id(axis=1)
+    if j >= V:
+        return
+    b0 = btile_id * BTILE
+    bs = b0 + tl.arange(0, BTILE)
+    mb = bs < B
+
+    row_start = tl.load(var_ptr + j)
+    row_end   = tl.load(var_ptr + j + 1)
+
+    # sum incoming nu over edges for batch lanes (vectorized)
+    sum_nu = tl.zeros((BTILE,), dtype=tl.float32)
+    tile = row_start
+    while tile < row_end:
+        offs = tile + tl.arange(0, BLOCK_SIZE)
+        mrow = offs < row_end
+        evec = tl.load(var_edges + offs, mask=mrow, other=0)                 # [BLOCK_SIZE]
+        mask2d = (mrow[:, None]) & (mb[None, :])
+        nu_tile = tl.load(nuT + (evec[:, None]) * B + bs[None, :], mask=mask2d, other=0.0)
+        sum_nu += tl.sum(tl.where(mask2d, nu_tile.to(tl.float32), 0.0), axis=0)
+        tile += BLOCK_SIZE
+
+    # beliefs and gamma mix (fp32 compute)
+    lam_bj = tl.load(lam + bs * V + j, mask=mb, other=0.0)
+    M_bj = lam_bj + sum_nu
+    tl.store(M + bs * V + j, M_bj, mask=mb)
+    if WRITE_HARD:
+        tl.store(hard_dec + bs * V + j, (M_bj < 0.0).to(tl.uint8), mask=mb)
+    g_bj = tl.load(gamma + bs * V + j, mask=mb, other=0.0)
+    lam0_j = tl.load(lam0 + j)
+    lam_new = (1.0 - g_bj) * lam0_j + g_bj * M_bj
+    tl.store(lam + bs * V + j, lam_new, mask=mb)
+
+    # write muT for each edge lane (vectorized)
+    tile = row_start
+    while tile < row_end:
+        offs = tile + tl.arange(0, BLOCK_SIZE)
+        mrow = offs < row_end
+        evec = tl.load(var_edges + offs, mask=mrow, other=0)
+        mask2d = (mrow[:, None]) & (mb[None, :])
+        nu_tile = tl.load(nuT + (evec[:, None]) * B + bs[None, :], mask=mask2d, other=0.0)
+        mu_tile = lam_new[None, :] + (sum_nu[None, :] - nu_tile.to(tl.float32))
+        if msg_is_fp16:
+            tl.store(muT + (evec[:, None]) * B + bs[None, :], mu_tile.to(tl.float16), mask=mask2d)
+        else:
+            tl.store(muT + (evec[:, None]) * B + bs[None, :], mu_tile, mask=mask2d)
+        tile += BLOCK_SIZE
+
+
+@triton.jit
+def relay_decode_persistent_kernel(
+    chk_ptr, chk_edges, var_ptr, var_edges, edge_var, edge_chk,
+    mu, nu, lam, M, gamma, hard_dec, check_ok,
+    lambda0,
+    rt_syndromes, rt_errors, rt_weights, rt_valid, rt_slot_state,
+    Q, C, V, E,
+    alpha, beta,
+    PRE_ITERS, SET_ITERS, NUM_SETS, CHECK_EVERY,
+    use_alpha: tl.constexpr, use_beta: tl.constexpr,
+    msg_is_fp16: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    ROWS_PER_CHK: tl.constexpr,
+    ROWS_PER_VAR: tl.constexpr,
+    MAX_STEPS: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    slot = pid
+    for _ in tl.static_range(0, MAX_STEPS):
+        slot = slot + 1
+        slot = tl.where(slot >= Q, 0, slot)
+        state = tl.load(rt_slot_state + slot)
+        work = state == 1
+        if work:
+            syn_base = slot * C
+            v0 = tl.arange(0, BLOCK_SIZE)
+            off_v = 0
+            while off_v < V:
+                vv = off_v + v0
+                mv = vv < V
+                tl.store(lam + vv, tl.load(lambda0 + vv, mask=mv, other=0.0), mask=mv)
+                tl.store(hard_dec + vv, 0, mask=mv)
+                off_v += BLOCK_SIZE
+            e0 = tl.arange(0, BLOCK_SIZE)
+            off_e = 0
+            while off_e < E:
+                ee = off_e + e0
+                me = ee < E
+                if msg_is_fp16:
+                    z16 = tl.zeros((BLOCK_SIZE,), dtype=tl.float16)
+                    tl.store(mu + ee, z16, mask=me)
+                    tl.store(nu + ee, z16, mask=me)
+                else:
+                    z32 = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+                    tl.store(mu + ee, z32, mask=me)
+                    tl.store(nu + ee, z32, mask=me)
+                off_e += BLOCK_SIZE
+
+            stop_now = 0
+            t = 0
+            while t < PRE_ITERS:
+                # C2V
+                ci = 0
+                while ci < C:
+                    r = 0
+                    while (r < ROWS_PER_CHK) & ((ci + r) < C):
+                        i = ci + r
+                        row_start = tl.load(chk_ptr + i)
+                        row_end   = tl.load(chk_ptr + i + 1)
+                        deg = row_end - row_start
+                        if deg > 0:
+                            neg_par = tl.zeros((), dtype=tl.int32)
+                            min1 = tl.full((), 1e30, dtype=tl.float32)
+                            min2 = tl.full((), 1e30, dtype=tl.float32)
+                            tile = row_start
+                            while tile < row_end:
+                                offs = tile + tl.arange(0, BLOCK_SIZE)
+                                mrow = offs < row_end
+                                evec = tl.load(chk_edges + offs, mask=mrow, other=0)
+                                mu_tile = tl.load(mu + evec, mask=mrow, other=0.0)
+                                neg_par += tl.sum((mu_tile < 0.0) & mrow, axis=0).to(tl.int32)
+                                a = tl.abs(mu_tile.to(tl.float32))
+                                a_mask = tl.where(mrow, a, 1e30)
+                                min1_t = tl.min(a_mask, axis=0)
+                                a2 = tl.where(a_mask == min1_t, 1e30, a_mask)
+                                min2_t = tl.min(a2, axis=0)
+                                better1 = min1_t < min1
+                                min2 = tl.where(better1, tl.minimum(min1, min2_t), tl.minimum(min2, min1_t))
+                                min1 = tl.where(better1, min1_t, min1)
+                                tile += BLOCK_SIZE
+                            syn_i = tl.load(rt_syndromes + syn_base + i).to(tl.int32) & 1
+                            par_bit = ((neg_par & 1) ^ syn_i)
+                            sign_prod = tl.where(par_bit == 0, 1.0, -1.0)
+                            tile2 = row_start
+                            while tile2 < row_end:
+                                offs = tile2 + tl.arange(0, BLOCK_SIZE)
+                                mrow = offs < row_end
+                                evec = tl.load(chk_edges + offs, mask=mrow, other=0)
+                                mu_tile = tl.load(mu + evec, mask=mrow, other=0.0)
+                                sgn = tl.where(mu_tile >= 0.0, 1.0, -1.0)
+                                out_mag = tl.where(deg == 1, 0.0, min1)
+                                if use_alpha:
+                                    out_mag = alpha * out_mag
+                                if use_beta:
+                                    out_mag = tl.maximum(out_mag - beta, 0.0)
+                                nu_tile = (sign_prod * sgn) * out_mag
+                                if msg_is_fp16:
+                                    tl.store(nu + evec, nu_tile.to(tl.float16), mask=mrow)
+                                else:
+                                    tl.store(nu + evec, nu_tile, mask=mrow)
+                                tile2 += BLOCK_SIZE
+                        r += 1
+                    ci += ROWS_PER_CHK
+                # V2C + gamma
+                vj = 0
+                while vj < V:
+                    r = 0
+                    while (r < ROWS_PER_VAR) & ((vj + r) < V):
+                        j = vj + r
+                        row_start = tl.load(var_ptr + j)
+                        row_end   = tl.load(var_ptr + j + 1)
+                        sum_nu = tl.zeros((), dtype=tl.float32)
+                        tile = row_start
+                        while tile < row_end:
+                            offs = tile + tl.arange(0, BLOCK_SIZE)
+                            mrow = offs < row_end
+                            evec = tl.load(var_edges + offs, mask=mrow, other=0)
+                            nu_tile = tl.load(nu + evec, mask=mrow, other=0.0)
+                            sum_nu += tl.sum(tl.where(mrow, nu_tile.to(tl.float32), 0.0), axis=0)
+                            tile += BLOCK_SIZE
+                        lam_j = tl.load(lam + j)
+                        M_j = lam_j + sum_nu
+                        tl.store(M + j, M_j)
+                        tl.store(hard_dec + j, (M_j < 0.0).to(tl.uint8))
+                        g_j = tl.load(gamma + j)
+                        lam0_j = tl.load(lambda0 + j)
+                        lam_new = (1.0 - g_j) * lam0_j + g_j * M_j
+                        tl.store(lam + j, lam_new)
+                        tile2 = row_start
+                        while tile2 < row_end:
+                            offs = tile2 + tl.arange(0, BLOCK_SIZE)
+                            mrow = offs < row_end
+                            evec = tl.load(var_edges + offs, mask=mrow, other=0)
+                            nu_tile = tl.load(nu + evec, mask=mrow, other=0.0)
+                            mu_tile = lam_new + (sum_nu - nu_tile.to(tl.float32))
+                            if msg_is_fp16:
+                                tl.store(mu + evec, mu_tile.to(tl.float16), mask=mrow)
+                            else:
+                                tl.store(mu + evec, mu_tile, mask=mrow)
+                            tile2 += BLOCK_SIZE
+                        r += 1
+                    vj += ROWS_PER_VAR
+                # parity cadence
+                if ((t + 1) % CHECK_EVERY) == 0:
+                    all_ok = 1
+                    ci2 = 0
+                    while ci2 < C:
+                        i = ci2
+                        row_start = tl.load(chk_ptr + i)
+                        row_end   = tl.load(chk_ptr + i + 1)
+                        par = tl.zeros((), dtype=tl.int32)
+                        tilep = row_start
+                        while tilep < row_end:
+                            offs = tilep + tl.arange(0, BLOCK_SIZE)
+                            mrow = offs < row_end
+                            evec = tl.load(chk_edges + offs, mask=mrow, other=0)
+                            vvec = tl.load(edge_var + evec, mask=mrow, other=0)
+                            bits = tl.load(hard_dec + vvec, mask=mrow, other=0).to(tl.int32) & 1
+                            par = par ^ (tl.sum(tl.where(mrow, bits, 0), axis=0) & 1)
+                            tilep += BLOCK_SIZE
+                        syn_i = tl.load(rt_syndromes + syn_base + i).to(tl.int32) & 1
+                        ok = (par == syn_i).to(tl.uint8)
+                        tl.store(check_ok + i, ok)
+                        all_ok = all_ok & ok.to(tl.int32)
+                        ci2 += 1
+                    stop_now = tl.where(all_ok == 1, 1, stop_now)
+                t += 1
+            # relay legs
+            leg = 0
+            while leg < NUM_SETS:
+                if stop_now == 0:
+                    tt = 0
+                    while tt < SET_ITERS:
+                        if stop_now == 0:
+                            # c2v
+                            ci = 0
+                            while ci < C:
+                                r = 0
+                                while (r < ROWS_PER_CHK) & ((ci + r) < C):
+                                    i = ci + r
+                                    row_start = tl.load(chk_ptr + i)
+                                    row_end   = tl.load(chk_ptr + i + 1)
+                                    deg = row_end - row_start
+                                    if deg > 0:
+                                        neg_par = tl.zeros((), dtype=tl.int32)
+                                        min1 = tl.full((), 1e30, dtype=tl.float32)
+                                        min2 = tl.full((), 1e30, dtype=tl.float32)
+                                        tile = row_start
+                                        while tile < row_end:
+                                            offs = tile + tl.arange(0, BLOCK_SIZE)
+                                            mrow = offs < row_end
+                                            evec = tl.load(chk_edges + offs, mask=mrow, other=0)
+                                            mu_tile = tl.load(mu + evec, mask=mrow, other=0.0)
+                                            neg_par += tl.sum((mu_tile < 0.0) & mrow, axis=0).to(tl.int32)
+                                            a = tl.abs(mu_tile.to(tl.float32))
+                                            a_mask = tl.where(mrow, a, 1e30)
+                                            min1_t = tl.min(a_mask, axis=0)
+                                            a2 = tl.where(a_mask == min1_t, 1e30, a_mask)
+                                            min2_t = tl.min(a2, axis=0)
+                                            better1 = min1_t < min1
+                                            min2 = tl.where(better1, tl.minimum(min1, min2_t), tl.minimum(min2, min1_t))
+                                            min1 = tl.where(better1, min1_t, min1)
+                                            tile += BLOCK_SIZE
+                                        syn_i = tl.load(rt_syndromes + syn_base + i).to(tl.int32) & 1
+                                        par_bit = ((neg_par & 1) ^ syn_i)
+                                        sign_prod = tl.where(par_bit == 0, 1.0, -1.0)
+                                        tile2 = row_start
+                                        while tile2 < row_end:
+                                            offs = tile2 + tl.arange(0, BLOCK_SIZE)
+                                            mrow = offs < row_end
+                                            evec = tl.load(chk_edges + offs, mask=mrow, other=0)
+                                            mu_tile = tl.load(mu + evec, mask=mrow, other=0.0)
+                                            sgn = tl.where(mu_tile >= 0.0, 1.0, -1.0)
+                                            out_mag = tl.where(deg == 1, 0.0, min1)
+                                            if use_alpha:
+                                                out_mag = alpha * out_mag
+                                            if use_beta:
+                                                out_mag = tl.maximum(out_mag - beta, 0.0)
+                                            nu_tile = (sign_prod * sgn) * out_mag
+                                            if msg_is_fp16:
+                                                tl.store(nu + evec, nu_tile.to(tl.float16), mask=mrow)
+                                            else:
+                                                tl.store(nu + evec, nu_tile, mask=mrow)
+                                            tile2 += BLOCK_SIZE
+                                    r += 1
+                                ci += ROWS_PER_CHK
+                            # v2c+gamma
+                            vj = 0
+                            while vj < V:
+                                r = 0
+                                while (r < ROWS_PER_VAR) & ((vj + r) < V):
+                                    j = vj + r
+                                    row_start = tl.load(var_ptr + j)
+                                    row_end   = tl.load(var_ptr + j + 1)
+                                    sum_nu = tl.zeros((), dtype=tl.float32)
+                                    tile = row_start
+                                    while tile < row_end:
+                                        offs = tile + tl.arange(0, BLOCK_SIZE)
+                                        mrow = offs < row_end
+                                        evec = tl.load(var_edges + offs, mask=mrow, other=0)
+                                        nu_tile = tl.load(nu + evec, mask=mrow, other=0.0)
+                                        sum_nu += tl.sum(tl.where(mrow, nu_tile.to(tl.float32), 0.0), axis=0)
+                                        tile += BLOCK_SIZE
+                                    lam_j = tl.load(lam + j)
+                                    M_j = lam_j + sum_nu
+                                    tl.store(M + j, M_j)
+                                    tl.store(hard_dec + j, (M_j < 0.0).to(tl.uint8))
+                                    g_j = tl.load(gamma + j)
+                                    lam0_j = tl.load(lambda0 + j)
+                                    lam_new = (1.0 - g_j) * lam0_j + g_j * M_j
+                                    tl.store(lam + j, lam_new)
+                                    tile2 = row_start
+                                    while tile2 < row_end:
+                                        offs = tile2 + tl.arange(0, BLOCK_SIZE)
+                                        mrow = offs < row_end
+                                        evec = tl.load(var_edges + offs, mask=mrow, other=0)
+                                        nu_tile = tl.load(nu + evec, mask=mrow, other=0.0)
+                                        mu_tile = lam_new + (sum_nu - nu_tile.to(tl.float32))
+                                        if msg_is_fp16:
+                                            tl.store(mu + evec, mu_tile.to(tl.float16), mask=mrow)
+                                        else:
+                                            tl.store(mu + evec, mu_tile, mask=mrow)
+                                        tile2 += BLOCK_SIZE
+                                    r += 1
+                                vj += ROWS_PER_VAR
+                            if ((tt + 1) % CHECK_EVERY) == 0:
+                                all_ok = 1
+                                ci2 = 0
+                                while ci2 < C:
+                                    i = ci2
+                                    row_start = tl.load(chk_ptr + i)
+                                    row_end   = tl.load(chk_ptr + i + 1)
+                                    par = tl.zeros((), dtype=tl.int32)
+                                    tilep = row_start
+                                    while tilep < row_end:
+                                        offs = tilep + tl.arange(0, BLOCK_SIZE)
+                                        mrow = offs < row_end
+                                        evec = tl.load(chk_edges + offs, mask=mrow, other=0)
+                                        vvec = tl.load(edge_var + evec, mask=mrow, other=0)
+                                        bits = tl.load(hard_dec + vvec, mask=mrow, other=0).to(tl.int32) & 1
+                                        par = par ^ (tl.sum(tl.where(mrow, bits, 0), axis=0) & 1)
+                                        tilep += BLOCK_SIZE
+                                    syn_i = tl.load(rt_syndromes + syn_base + i).to(tl.int32) & 1
+                                    ok = (par == syn_i).to(tl.uint8)
+                                    tl.store(check_ok + i, ok)
+                                    all_ok = all_ok & ok.to(tl.int32)
+                                    ci2 += 1
+                                stop_now = tl.where(all_ok == 1, 1, stop_now)
+                        tt += 1
+                # final parity after leg
+                if stop_now == 0:
+                    all_ok = 1
+                    ci2 = 0
+                    while ci2 < C:
+                        i = ci2
+                        row_start = tl.load(chk_ptr + i)
+                        row_end   = tl.load(chk_ptr + i + 1)
+                        par = tl.zeros((), dtype=tl.int32)
+                        tilep = row_start
+                        while tilep < row_end:
+                            offs = tilep + tl.arange(0, BLOCK_SIZE)
+                            mrow = offs < row_end
+                            evec = tl.load(chk_edges + offs, mask=mrow, other=0)
+                            vvec = tl.load(edge_var + evec, mask=mrow, other=0)
+                            bits = tl.load(hard_dec + vvec, mask=mrow, other=0).to(tl.int32) & 1
+                            par = par ^ (tl.sum(tl.where(mrow, bits, 0), axis=0) & 1)
+                            tilep += BLOCK_SIZE
+                        syn_i = tl.load(rt_syndromes + syn_base + i).to(tl.int32) & 1
+                        ok = (par == syn_i).to(tl.uint8)
+                        tl.store(check_ok + i, ok)
+                        all_ok = all_ok & ok.to(tl.int32)
+                        ci2 += 1
+                    stop_now = tl.where(all_ok == 1, 1, stop_now)
+                leg += 1
+            # write outputs
+            off = 0
+            base_v = slot * V
+            while off < V:
+                vv = off + tl.arange(0, BLOCK_SIZE)
+                mv = vv < V
+                vals = tl.load(hard_dec + vv, mask=mv, other=0)
+                tl.store(rt_errors + base_v + vv, vals, mask=mv)
+                off += BLOCK_SIZE
+            tl.store(rt_weights + slot, 0.0)
+            tl.store(rt_valid + slot, (stop_now == 1).to(tl.uint8))
+            tl.store(rt_slot_state + slot, 2)
+
+
 # Global autotuner instance
 _autotuner = KernelAutotuner()
 
