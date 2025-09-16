@@ -25,12 +25,65 @@ class RelayBPPaperStudy:
         self.output_dir.mkdir(exist_ok=True)
         self.results = []
         
+    def _csv_fieldnames(self) -> list[str]:
+        return [
+            # Configuration parameters
+            'config_name', 'num_sets', 'stop_nconv', 'gamma0', 'gamma_dist_min', 'gamma_dist_max',
+            'pre_iter', 'set_max_iter', 'circuit', 'distance', 'rounds', 'error_rate', 'basis',
+            'max_iter',
+            # Experiment results
+            'shots', 'logical_errors', 'logical_error_rate', 'per_cycle_logical_error_rate',
+            'per_round_per_qubit_rate', 'avg_bp_iterations', 'runtime_per_shot_ns'
+        ]
+
+    def _row_from_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            'config_name': result.get('config_name', ''),
+            'num_sets': result.get('num_sets', ''),
+            'stop_nconv': result.get('stop_nconv', ''),
+            'gamma0': result.get('gamma0', ''),
+            'gamma_dist_min': result.get('gamma_dist_interval', [None, None])[0] if result.get('gamma_dist_interval') else '',
+            'gamma_dist_max': result.get('gamma_dist_interval', [None, None])[1] if result.get('gamma_dist_interval') else '',
+            'pre_iter': result.get('pre_iter', ''),
+            'set_max_iter': result.get('set_max_iter', ''),
+            'circuit': result.get('config', {}).get('circuit', ''),
+            'distance': result.get('config', {}).get('distance', ''),
+            'rounds': result.get('config', {}).get('rounds', ''),
+            'error_rate': result.get('config', {}).get('error_rate', ''),
+            'basis': 'xz',
+            'max_iter': result.get('config', {}).get('max_iter', ''),
+            'shots': result.get('shots', ''),
+            'logical_errors': result.get('logical_errors', ''),
+            'logical_error_rate': result.get('logical_error_rate', ''),
+            'per_cycle_logical_error_rate': result.get('per_cycle_logical_error_rate', ''),
+            'per_round_per_qubit_rate': result.get('per_round_per_qubit_rate', ''),
+            'avg_bp_iterations': result.get('avg_bp_iterations', ''),
+            'runtime_per_shot_ns': result.get('runtime_per_shot_ns', ''),
+        }
+
+    def save_result_incremental(self, result: Dict[str, Any]):
+        """Append a single result to CSV immediately (creates file with header if missing)."""
+        csv_path = self.output_dir / "paper_study_results.csv"
+        write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+        with open(csv_path, 'a', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=self._csv_fieldnames())
+            if write_header:
+                writer.writeheader()
+            writer.writerow(self._row_from_result(result))
+        # Also drop a JSON sidecar per run for robustness
+        json_path = self.output_dir / f"{result.get('config_name','result')}.json"
+        try:
+            with open(json_path, 'w') as f:
+                json.dump(result, f, indent=2)
+        except Exception:
+            pass
+
     
     def define_parameter_grid(self):
         # Fix S (stop_nconv) and sweep R (num_sets) broadly per the paper
         stop_nconv_values = [1, 2, 3, 5, 7, 9]
         # Use an odd sweep for R to populate x-axis (adjust upper bound as needed)
-        num_sets_values = list(range(1, 61, 2))  # e.g., 1,3,5,...,59
+        num_sets_values = [1, 3, 5, 9, 13, 21, 45]
         configs = []
         for s in stop_nconv_values:
             for r in num_sets_values:
@@ -47,7 +100,7 @@ class RelayBPPaperStudy:
 
     def define_plain_bp_grid(self):
         # Sweep plain BP (no memory, no relay) by max_iter to populate x-axis
-        max_iter_values = [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 200, 300]
+        max_iter_values = [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 200, 300, 500]
         configs = []
         for tmax in max_iter_values:
             configs.append({
@@ -144,6 +197,7 @@ class RelayBPPaperStudy:
             result = self.run_single_plain_bp_config(config, shots)
             if result is not None:
                 self.results.append(result)
+                self.save_result_incremental(result)
         
         print(f"\nPlain BP Study completed! Collected {len(self.results)} results.")
 
@@ -154,6 +208,7 @@ class RelayBPPaperStudy:
             result = self.run_single_config(config, shots)
             if result is not None:
                 self.results.append(result)
+                self.save_result_incremental(result)
         
         print(f"\nStudy completed! Collected {len(self.results)} results.")
 
@@ -174,42 +229,10 @@ class RelayBPPaperStudy:
         
         csv_path = self.output_dir / "paper_study_results.csv"
         with open(csv_path, 'w', newline='') as csvfile:
-            fieldnames = [
-                # Configuration parameters
-                'config_name', 'num_sets', 'stop_nconv', 'gamma0', 'gamma_dist_min', 'gamma_dist_max',
-                'pre_iter', 'set_max_iter', 'circuit', 'distance', 'rounds', 'error_rate', 'basis',
-                'max_iter',
-                # Experiment results
-                'shots', 'logical_errors', 'logical_error_rate', 'per_cycle_logical_error_rate',
-                'avg_bp_iterations', 'runtime_per_shot_ns'
-            ]
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer = csv.DictWriter(csvfile, fieldnames=self._csv_fieldnames())
             writer.writeheader()
             for result in self.results:
-                # Extract all parameters from config and results
-                row = {
-                    'config_name': result.get('config_name', ''),
-                    'num_sets': result.get('num_sets', ''),
-                    'stop_nconv': result.get('stop_nconv', ''),
-                    'gamma0': result.get('gamma0', ''),
-                    'gamma_dist_min': result.get('gamma_dist_interval', [None, None])[0] if result.get('gamma_dist_interval') else '',
-                    'gamma_dist_max': result.get('gamma_dist_interval', [None, None])[1] if result.get('gamma_dist_interval') else '',
-                    'pre_iter': result.get('pre_iter', ''),
-                    'set_max_iter': result.get('set_max_iter', ''),
-                    'circuit': result.get('config', {}).get('circuit', ''),
-                    'distance': result.get('config', {}).get('distance', ''),
-                    'rounds': result.get('config', {}).get('rounds', ''),
-                    'error_rate': result.get('config', {}).get('error_rate', ''),
-                    'basis': 'xz',  # Fixed for this study
-                    'max_iter': result.get('config', {}).get('max_iter', ''),
-                    'shots': result.get('shots', ''),
-                    'logical_errors': result.get('logical_errors', ''),
-                    'logical_error_rate': result.get('logical_error_rate', ''),
-                    'per_cycle_logical_error_rate': result.get('per_cycle_logical_error_rate', ''),
-                    'avg_bp_iterations': result.get('avg_bp_iterations', ''),
-                    'runtime_per_shot_ns': result.get('runtime_per_shot_ns', '')
-                }
-                writer.writerow(row)
+                writer.writerow(self._row_from_result(result))
         
         print(f"Results saved to: {csv_path}")
     
