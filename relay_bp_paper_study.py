@@ -222,7 +222,12 @@ class RelayBPPaperStudy:
         print(f"{'R (num_sets)':<12} {'S (stop_nconv)':<15} {'BP Iterations':<15} {'LER':<12} {'Per-cycle LER':<15}")
         print("-" * 100)
         for result in self.results:
-            print(f"{result['num_sets']:<12} {result['stop_nconv']:<15} {result['avg_bp_iterations']:<15.1f} {result['logical_error_rate']:<12.2e} {result['per_cycle_logical_error_rate']:<15.2e}")
+            r = result.get('num_sets', '-')
+            s = result.get('stop_nconv', '-')
+            avg_it = result.get('avg_bp_iterations', 0.0)
+            ler = result.get('logical_error_rate', 0.0)
+            pc_ler = result.get('per_cycle_logical_error_rate', 0.0)
+            print(f"{str(r):<12} {str(s):<15} {avg_it:<15.1f} {ler:<12.2e} {pc_ler:<15.2e}")
     
     def plot_performance_curves(self):
         """Print performance data for manual plotting."""
