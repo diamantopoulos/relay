@@ -47,7 +47,7 @@ class RelayBPPaperStudy:
 
     def define_plain_bp_grid(self):
         # Sweep plain BP (no memory, no relay) by max_iter to populate x-axis
-        max_iter_values = list(range(20, 361, 40))  # 20,40,...,360
+        max_iter_values = [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 200, 300]
         configs = []
         for tmax in max_iter_values:
             configs.append({
