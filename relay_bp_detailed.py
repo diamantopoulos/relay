@@ -169,16 +169,15 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
         synd, obs = sampler.sample(batch, separate_observables=True)
         synd_u8 = synd.astype(np.uint8)
         
-        # Get detailed results for iteration counting
-        det = observable_decoder.decode_detailed_batch(synd_u8, parallel=parallel)
-        iters_arr = np.array([r.iterations for r in det], dtype=float)
-        bp_iters_all.extend(iters_arr.tolist())  # r.iterations = BP iterations
-        # Derive legs only for reporting/debug (not for avg iteration computation)
+        # Single detailed decode that provides both iterations and observables
+        obs_det = observable_decoder.decode_observables_detailed_batch(
+            synd_u8, parallel=parallel
+        )
+        iters_arr = np.array([r.iterations for r in obs_det], dtype=float)
+        bp_iters_all.extend(iters_arr.tolist())
+        # Derive legs only for reporting/debug (not used for x-axis)
         legs_all.extend(1.0 + np.maximum(0.0, (iters_arr - pre_iter) / set_max_iter))
-        
-        # Get predictions for error counting using detailed path to ensure any frames are applied
-        obs_det = observable_decoder.decode_observables_detailed_batch(synd_u8, parallel=parallel)
-        # Extract observables from results list into array
+        # Extract observables from results into array
         pred = np.stack([r.observables for r in obs_det], axis=0)
         pred = pred.astype(np.uint8, copy=False)
         
@@ -305,12 +304,12 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
         synd, obs = sampler.sample(batch, separate_observables=True)
         synd_u8 = synd.astype(np.uint8)
 
-        # Detailed decoding to get iterations and predicted observables
-        det = observable_decoder.decode_detailed_batch(synd_u8, parallel=parallel)
-        iters_arr = np.array([r.iterations for r in det], dtype=float)
+        # Single detailed decode that provides both iterations and predicted observables
+        obs_det = observable_decoder.decode_observables_detailed_batch(
+            synd_u8, parallel=parallel
+        )
+        iters_arr = np.array([r.iterations for r in obs_det], dtype=float)
         iters_all.extend(iters_arr.tolist())
-
-        obs_det = observable_decoder.decode_observables_detailed_batch(synd_u8, parallel=parallel)
         pred = np.stack([r.observables for r in obs_det], axis=0).astype(np.uint8, copy=False)
         obs_u8 = obs.astype(np.uint8, copy=False)
         errs = (np.bitwise_xor(pred, obs_u8).any(axis=1)).sum()
