@@ -19,6 +19,39 @@ from testdata import get_test_circuit, filter_detectors_by_basis
 import stim
 import relay_bp
 from relay_bp.stim.sinter.check_matrices import CheckMatrices
+import hashlib
+import json
+
+
+def _select_backend(backend: str):
+    """Return (RelayDecoderF64, ObservableDecoderRunner, MinSumBPDecoderF64_or_None) for chosen backend."""
+    if backend == "torch":
+        from relay_bp_torch_adapter import RelayDecoderF64Torch as _RelayDecoderF64
+        from relay_bp_torch_adapter import ObservableDecoderRunnerTorch as _ObservableDecoderRunner
+        return _RelayDecoderF64, _ObservableDecoderRunner, None
+    if backend == "triton":
+        from relay_bp_triton_adapter import RelayDecoderF64 as _RelayDecoderF64
+        from relay_bp_triton_adapter import ObservableDecoderRunner as _ObservableDecoderRunner
+        return _RelayDecoderF64, _ObservableDecoderRunner, None
+    # rust
+    from relay_bp import RelayDecoderF64 as _RelayDecoderF64
+    from relay_bp import ObservableDecoderRunner as _ObservableDecoderRunner
+    from relay_bp import MinSumBPDecoderF64 as _MinSumBPDecoderF64
+    return _RelayDecoderF64, _ObservableDecoderRunner, _MinSumBPDecoderF64
+
+
+def _format_time_units(ns: float) -> str:
+    """Return a compact string with ns, µs, ms, and s for a given nanoseconds value."""
+    us = ns / 1e3
+    ms = ns / 1e6
+    s = ns / 1e9
+    return f"{ns:.1f} ns | {us:.3f} µs | {ms:.3f} ms | {s:.6f} s"
+
+
+def _hash_update_arr(hasher: "hashlib._blake2.blake2b", arr) -> None:
+    """Update hasher with array data in C-order with stable dtype."""
+    a = np.ascontiguousarray(arr)
+    hasher.update(a.tobytes(order="C"))
 
 
 def parse_args():
@@ -32,7 +65,6 @@ def parse_args():
     parser.add_argument('--distance', type=int, default=12, help='Code distance (default: 12)')
     parser.add_argument('--rounds', type=int, default=12, help='Number of rounds (default: 12)')
     parser.add_argument('--error-rate', type=float, default=0.003, help='Physical error rate (default: 0.003)')
-    parser.add_argument('--shots', type=int, default=1000, help='Number of shots (default: 1000)')
     parser.add_argument('--target-errors', type=int, default=10, help='Target number of errors to collect (default: 10)')
     parser.add_argument('--batch', type=int, default=2000, help='Batch size for error collection (default: 2000)')
     parser.add_argument('--max-shots', type=int, default=1000000, help='Maximum shots to collect (default: 1000000)')
@@ -50,7 +82,10 @@ def parse_args():
     parser.add_argument('--parallel', action='store_true', help='Enable Relay-BP builtin parallelism (default: False)')
     parser.add_argument('--output-format', type=str, choices=['simple', 'json', 'csv'], default='simple',
                        help='Output format (default: simple)')
-    parser.add_argument('--measure-time', action='store_true', help='Measure and report execution time')
+    parser.add_argument('--seed', type=int, default=0, help='Global seed for all random number generators (default: 0)')
+    parser.add_argument('--backend', type=str, choices=['rust', 'torch', 'triton'], default=None,
+                       help='Decoder backend to use: rust (default), torch, or triton')
+    # Always measure and report execution time unconditionally
     
     return parser.parse_args()
 
@@ -74,23 +109,19 @@ def run_relay_bp_detailed(args):
         batch=args.batch,
         max_shots=args.max_shots,
         parallel=args.parallel,
-        measure_time=args.measure_time
+        seed=args.seed,
+        backend=args.backend,
     )
 
 
 def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0, pre_iter, 
                            num_sets, set_max_iter, gamma_dist_min, gamma_dist_max, stop_nconv,
-                           target_errors=20, batch=2000, max_shots=1000000, parallel=True, 
-                           measure_time=True):
+                           target_errors=20, batch=2000, max_shots=1000000, parallel=True, seed=0, backend: str | None = None):
     """Run Relay-BP experiment with detailed iteration counting - reusable function."""
     
-    # Deterministic seeding (optional but helpful for reproducibility)
-    try:
-        random.seed(0)
-        np.random.seed(0)
-        stim.set_global_seed(0)
-    except Exception:
-        pass
+    # Deterministic seeding using global seed
+    random.seed(seed)
+    np.random.seed(seed)
 
     # Get test circuit
     circuit_obj = get_test_circuit(
@@ -109,7 +140,13 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     dem = circuit_obj.detector_error_model()
     
     # Check observables count
-    print(f"DEM stats: detectors={dem.num_detectors}, observables={dem.num_observables}")
+    print("DEM:",
+        "detectors M =", dem.num_detectors,
+        "observables O =", dem.num_observables,
+        "errors N ≈", CheckMatrices.from_dem(dem).check_matrix.shape[1])
+    print("Per-cycle detectors ≈", dem.num_detectors // rounds)
+    print("Basis =", basis)
+
     print(f"Using rounds={rounds} as the number of cycles for per-cycle LER conversion")
     # Soft filename sanity check that circuit tag encodes distance/rounds
     if isinstance(circuit, str):
@@ -123,9 +160,32 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     
     # Create check matrices
     check_matrices = CheckMatrices.from_dem(dem)
+    # Initialize determinism hasher (32-byte BLAKE2b)
+    hasher = hashlib.blake2b(digest_size=32)
+    # Problem spec: H, observables, priors
+    cm = check_matrices.check_matrix
+    om = check_matrices.observables_matrix
+    _hash_update_arr(hasher, cm.indptr.astype(np.int64, copy=False))
+    _hash_update_arr(hasher, cm.indices.astype(np.int64, copy=False))
+    _hash_update_arr(hasher, om.indptr.astype(np.int64, copy=False))
+    _hash_update_arr(hasher, om.indices.astype(np.int64, copy=False))
+    _hash_update_arr(hasher, check_matrices.error_priors.astype(np.float64, copy=False))
+    # Config + seeds
+    cfg_txt = json.dumps({
+        "circuit": circuit, "basis": basis, "distance": distance, "rounds": rounds,
+        "error_rate": error_rate, "gamma0": gamma0, "pre_iter": pre_iter,
+        "num_sets": num_sets, "set_max_iter": set_max_iter,
+        "gamma_dist": [gamma_dist_min, gamma_dist_max],
+        "stop_nconv": stop_nconv, "parallel": bool(parallel),
+        "stim_seed": seed, "relay_seed": seed,
+    }, sort_keys=True).encode()
+    hasher.update(cfg_txt)
     
     # Create Relay-BP decoder (CPU). Use normalized min-sum alpha if provided.
-    decoder = relay_bp.RelayDecoderF64(
+    # Select backend adapters
+    _RelayDecoderF64, _ObservableDecoderRunner, _MinSumBPDecoderF64 = _select_backend(backend)
+
+    decoder = _RelayDecoderF64(
         check_matrices.check_matrix,
         error_priors=check_matrices.error_priors,
         gamma0=gamma0,
@@ -139,7 +199,7 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     )
     
     # Create observable decoder
-    observable_decoder = relay_bp.ObservableDecoderRunner(
+    observable_decoder = _ObservableDecoderRunner(
         decoder,
         check_matrices.observables_matrix,
         include_decode_result=True,  # Enable detailed results
@@ -149,37 +209,64 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     avg_bp_iterations = 0.0
     avg_legs = 0.0
     legs_all = []
-    # Error-targeted collection (prevents LER=0 and stabilizes estimates)
-    # Apply heuristic to avoid stopping too early at low LER
-    heuristic_max = 100 * target_errors * rounds
-    max_shots = max(max_shots, heuristic_max)
+    # Decoder-only timing accumulators (nanoseconds)
+    total_decode_ns = 0
+    total_decode_shots = 0
     
     total_shots = 0
     total_errors = 0
     bp_iters_all = []
     
-    
-    sampler = dem.compile_sampler()
+    sampler = dem.compile_sampler(seed=seed)
     print(f"Collecting until {target_errors} errors or {max_shots} shots...")
 
     # Measure time around the actual error-targeted collection loop
-    start_time = time.time() if measure_time else None
+    start_time = time.time()
     
     while total_errors < target_errors and total_shots < max_shots:
         # Use the proper evaluation path: sample errors and use from_errors_decode_observables_detailed_batch
+        #errors = np.load("errors.npy")        
         det, obs, errors = sampler.sample(batch, return_errors=True)
+        #np.save("errors.npy", errors)
         
         # Single detailed decode that provides both iterations and built-in error counting
+        t0_ns = time.perf_counter_ns()
         obs_det = observable_decoder.from_errors_decode_observables_detailed_batch(
             errors.astype(np.uint8), parallel=parallel
         )
+        t1_ns = time.perf_counter_ns()
+        if t0_ns is not None and t1_ns is not None:
+            total_decode_ns += (t1_ns - t0_ns)
+            total_decode_shots += len(obs_det)
+        # Determinism hash updates (after timing window)
+        _hash_update_arr(hasher, errors.astype(np.uint8, copy=False))
+        O = check_matrices.observables_matrix.shape[0]
+        pred_obs = np.empty((len(obs_det), O), dtype=np.uint8)
+        for i, r in enumerate(obs_det):
+            pred_obs[i, :] = np.asarray(r.observables, dtype=np.uint8)
+        _hash_update_arr(hasher, pred_obs)
         iters_arr = np.array([r.iterations for r in obs_det], dtype=float)
+        iters_i32 = np.fromiter((r.iterations for r in obs_det), dtype=np.int32, count=len(obs_det))
+        succ_arr  = np.fromiter((r.converged for r in obs_det), dtype=np.uint8, count=len(obs_det))
+        fail_arr  = np.fromiter((r.error_detected for r in obs_det), dtype=np.uint8, count=len(obs_det))
+        _hash_update_arr(hasher, iters_i32)
+        _hash_update_arr(hasher, succ_arr)
+        _hash_update_arr(hasher, fail_arr)
         bp_iters_all.extend(iters_arr.tolist())  # r.iterations = BP iterations
         # Derive legs only for reporting/debug (not for avg iteration computation)
         legs_all.extend(1.0 + np.maximum(0.0, (iters_arr - pre_iter) / set_max_iter))
         
         # Use built-in error_detected flag for counting failures
         errs = int(sum(r.error_detected for r in obs_det))
+        # Diagnostic breakdown
+        n = len(obs_det)
+        n_fail = errs
+        n_conv = int(sum(r.converged for r in obs_det))
+        n_ok = int(sum((not r.error_detected) and r.converged for r in obs_det))
+        n_bad_but_conv = int(sum(r.error_detected and r.converged for r in obs_det))
+        n_bad_and_nconv = n_fail - n_bad_but_conv
+        n_ok_and_nconv = int(sum((not r.error_detected) and (not r.converged) for r in obs_det))
+        print(f"    batch breakdown: success&conv={n_ok}, fail&conv={n_bad_but_conv}, fail&nconv={n_bad_and_nconv}, success&nconv={n_ok_and_nconv}, conv={n_conv}/{n}")
         total_errors += errs
         total_shots += batch
         
@@ -216,12 +303,24 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
         avg_bp_iterations = 0.0
         avg_legs = 0.0
     
-    # Calculate runtime per shot
+    # Calculate runtime per shot (end-to-end) and decoder-only metrics
     runtime_per_shot = None
-    end_time = time.time() if measure_time else None
-    if measure_time and start_time and end_time and total_shots > 0:
+    decoder_runtime_per_shot = None
+    decoder_runtime_per_iteration = None
+    decoder_runtime_per_leg = None
+    end_time = time.time()
+    if start_time and end_time and total_shots > 0:
         total_runtime_seconds = end_time - start_time
         runtime_per_shot = (total_runtime_seconds * 1e9) / total_shots  # Convert to nanoseconds
+    if total_decode_shots > 0:
+        decoder_runtime_per_shot = total_decode_ns / total_decode_shots
+        total_iterations = float(np.sum(bp_iters_all)) if bp_iters_all else 0.0
+        if total_iterations > 0:
+            decoder_runtime_per_iteration = total_decode_ns / total_iterations
+        if legs_all:
+            total_legs = float(np.sum(legs_all))
+            if total_legs > 0:
+                decoder_runtime_per_leg = total_decode_ns / total_legs
     
     # Prepare results (convert numpy types to Python types for JSON serialization)
     results_data = {
@@ -246,21 +345,33 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     
     if runtime_per_shot is not None:
         results_data['runtime_per_shot_ns'] = float(runtime_per_shot)
+    if decoder_runtime_per_shot is not None:
+        results_data['decoder_runtime_per_shot_ns'] = float(decoder_runtime_per_shot)
+    if decoder_runtime_per_iteration is not None:
+        results_data['decoder_runtime_per_iteration_ns'] = float(decoder_runtime_per_iteration)
+    if decoder_runtime_per_leg is not None:
+        results_data['decoder_runtime_per_leg_ns'] = float(decoder_runtime_per_leg)
     # Attach optional diagnostic to help verify cycle root choice
     results_data['per_cycle_ler_alt_half_rounds'] = float(per_cycle_ler_half_rounds)
+    # Finalize determinism hash
+    results_data['determinism_hash'] = hasher.hexdigest()
     
     return results_data
 
 
 def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
                             max_iter=200, alpha=None, target_errors=20, batch=2000,
-                            max_shots=1000000, parallel=True, measure_time=True):
+                            max_shots=1000000, parallel=True, seed=0):
     """Run plain min-sum BP (no relay, no memory) with detailed counting."""
 
     try:
-        random.seed(0)
-        np.random.seed(0)
-        stim.set_global_seed(0)
+        random.seed(seed)
+        np.random.seed(seed)
+        # Stim seeding - try different methods depending on version
+        if hasattr(stim, 'set_global_seed'):
+            stim.set_global_seed(seed)
+        elif hasattr(stim, 'set_seed'):
+            stim.set_seed(seed)
     except Exception:
         pass
 
@@ -280,6 +391,23 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
     assert dem.num_observables > 0
 
     check_matrices = CheckMatrices.from_dem(dem)
+    # Initialize determinism hasher (32-byte BLAKE2b)
+    hasher = hashlib.blake2b(digest_size=32)
+    # Problem spec: H, observables, priors
+    cm = check_matrices.check_matrix
+    om = check_matrices.observables_matrix
+    _hash_update_arr(hasher, cm.indptr.astype(np.int64, copy=False))
+    _hash_update_arr(hasher, cm.indices.astype(np.int64, copy=False))
+    _hash_update_arr(hasher, om.indptr.astype(np.int64, copy=False))
+    _hash_update_arr(hasher, om.indices.astype(np.int64, copy=False))
+    _hash_update_arr(hasher, check_matrices.error_priors.astype(np.float64, copy=False))
+    # Config + seeds
+    cfg_txt = json.dumps({
+        "circuit": circuit, "basis": basis, "distance": distance, "rounds": rounds,
+        "error_rate": error_rate, "max_iter": max_iter, "alpha": alpha,
+        "parallel": bool(parallel), "stim_seed": seed
+    }, sort_keys=True).encode()
+    hasher.update(cfg_txt)
 
     # Build plain min-sum decoder (no relay, no memory)
     kwargs = dict(
@@ -288,8 +416,11 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
         alpha=None if (alpha == 0.0) else alpha,
         gamma0=None,
     )
-    decoder = relay_bp.MinSumBPDecoderF64(check_matrices.check_matrix, **kwargs)
-    observable_decoder = relay_bp.ObservableDecoderRunner(
+    # Always use rust path for plain BP
+    _, _, _MinSumBPDecoderF64 = _select_backend("rust")
+    decoder = _MinSumBPDecoderF64(check_matrices.check_matrix, **kwargs)
+    from relay_bp import ObservableDecoderRunner as _RustObservableRunner
+    observable_decoder = _RustObservableRunner(
         decoder,
         check_matrices.observables_matrix,
         include_decode_result=True,
@@ -298,24 +429,53 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
     total_shots = 0
     total_errors = 0
     iters_all = []
+    # Decoder-only timing accumulators (nanoseconds)
+    total_decode_ns = 0
+    total_decode_shots = 0
 
-    sampler = dem.compile_sampler()
+    sampler = dem.compile_sampler(seed=seed)
     print(f"Collecting until {target_errors} errors or {max_shots} shots...")
-    start_time = time.time() if measure_time else None
+    start_time = time.time()
 
     while total_errors < target_errors and total_shots < max_shots:
         # Use the proper evaluation path: sample errors and use from_errors_decode_observables_detailed_batch
         det, obs, errors = sampler.sample(batch, return_errors=True)
-        
+
         # Single detailed decode that provides both iterations and built-in error counting
+        t0_ns = time.perf_counter_ns()
         obs_det = observable_decoder.from_errors_decode_observables_detailed_batch(
             errors.astype(np.uint8), parallel=parallel
         )
+        t1_ns = time.perf_counter_ns()
+        total_decode_ns += (t1_ns - t0_ns)
+        total_decode_shots += len(obs_det)
+        # Determinism hash updates (after timing window)
+        _hash_update_arr(hasher, errors.astype(np.uint8, copy=False))
+        O = check_matrices.observables_matrix.shape[0]
+        pred_obs = np.empty((len(obs_det), O), dtype=np.uint8)
+        for i, r in enumerate(obs_det):
+            pred_obs[i, :] = np.asarray(r.observables, dtype=np.uint8)
+        _hash_update_arr(hasher, pred_obs)
+        iters_i32 = np.fromiter((r.iterations for r in obs_det), dtype=np.int32, count=len(obs_det))
+        succ_arr  = np.fromiter((r.converged for r in obs_det), dtype=np.uint8, count=len(obs_det))
+        fail_arr  = np.fromiter((r.error_detected for r in obs_det), dtype=np.uint8, count=len(obs_det))
+        _hash_update_arr(hasher, iters_i32)
+        _hash_update_arr(hasher, succ_arr)
+        _hash_update_arr(hasher, fail_arr)
         iters_arr = np.array([r.iterations for r in obs_det], dtype=float)
         iters_all.extend(iters_arr.tolist())
         
         # Use built-in error_detected flag for counting failures
         errs = int(sum(r.error_detected for r in obs_det))
+        # Diagnostic breakdown
+        n = len(obs_det)
+        n_fail = errs
+        n_conv = int(sum(r.converged for r in obs_det))
+        n_ok_conv = int(sum((not r.error_detected) and r.converged for r in obs_det))
+        n_bad_but_conv = int(sum(r.error_detected and r.converged for r in obs_det))
+        n_bad_and_nconv = n_fail - n_bad_but_conv
+        n_ok_and_nconv = int(sum((not r.error_detected) and (not r.converged) for r in obs_det))
+        print(f"    batch breakdown: success&conv={n_ok_conv}, fail&conv={n_bad_but_conv}, fail&nconv={n_bad_and_nconv}, success&nconv={n_ok_and_nconv}, conv={n_conv}/{n}")
         total_errors += errs
         total_shots += batch
         print(f"  Collected {total_shots} shots, {total_errors} errors (batch errors: {errs})")
@@ -330,14 +490,21 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
     else:
         k_guess = obs_count
 
-    per_round_per_qubit_rate = per_cycle_ler / (rounds * max(1, k_guess))
+    per_round_per_qubit_rate = ler / (rounds * max(1, k_guess))
 
     avg_bp_iterations = float(np.mean(iters_all)) if iters_all else 0.0
 
     runtime_per_shot = None
-    end_time = time.time() if measure_time else None
-    if measure_time and start_time and end_time and total_shots > 0:
+    decoder_runtime_per_shot = None
+    decoder_runtime_per_iteration = None
+    end_time = time.time()
+    if start_time and end_time and total_shots > 0:
         runtime_per_shot = (end_time - start_time) * 1e9 / total_shots
+    if total_decode_shots > 0:
+        decoder_runtime_per_shot = total_decode_ns / total_decode_shots
+        total_iterations = float(np.sum(iters_all)) if iters_all else 0.0
+        if total_iterations > 0:
+            decoder_runtime_per_iteration = total_decode_ns / total_iterations
 
     out = {
         'shots': int(total_shots),
@@ -357,6 +524,11 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
     }
     if runtime_per_shot is not None:
         out['runtime_per_shot_ns'] = float(runtime_per_shot)
+    if decoder_runtime_per_shot is not None:
+        out['decoder_runtime_per_shot_ns'] = float(decoder_runtime_per_shot)
+    if decoder_runtime_per_iteration is not None:
+        out['decoder_runtime_per_iteration_ns'] = float(decoder_runtime_per_iteration)
+    out['determinism_hash'] = hasher.hexdigest()
     return out
 
 
@@ -396,13 +568,12 @@ def main():
     
     # Execution parameters
     print("Execution Parameters:")
-    print(f"  Shots: {args.shots}")
     print(f"  Target Errors: {args.target_errors}")
     print(f"  Batch Size: {args.batch}")
     print(f"  Max Shots: {args.max_shots}")
     print(f"  Parallel: {args.parallel}")
     print(f"  Output Format: {args.output_format}")
-    print(f"  Measure Time: {args.measure_time}")
+    print(f"  Seed: {args.seed}")
     print()
     print("=" * 80)
     print()
@@ -417,7 +588,15 @@ def main():
         print(f"Per-Cycle Logical Error Rate: {results['per_cycle_logical_error_rate']:.2e}")
         print(f"Average BP Iterations: {results['avg_bp_iterations']:.1f} (legs: {results['avg_legs']:.1f})")
         if 'runtime_per_shot_ns' in results:
-            print(f"Runtime per shot: {results['runtime_per_shot_ns']:.1f} ns")
+            print(f"Runtime per shot: {_format_time_units(results['runtime_per_shot_ns'])}")
+        # Decoder-only timing metrics if available
+        if 'decoder_runtime_per_shot_ns' in results:
+            print(f"Decoder runtime per shot: {_format_time_units(results['decoder_runtime_per_shot_ns'])}")
+        if 'decoder_runtime_per_iteration_ns' in results:
+            print(f"Decoder runtime per iteration: {_format_time_units(results['decoder_runtime_per_iteration_ns'])}")
+        if 'decoder_runtime_per_leg_ns' in results:
+            print(f"Decoder runtime per leg: {_format_time_units(results['decoder_runtime_per_leg_ns'])}")
+        print(f"Determinism hash: {results.get('determinism_hash','-')}")
     
     elif args.output_format == 'json':
         import json

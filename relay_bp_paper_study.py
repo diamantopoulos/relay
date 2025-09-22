@@ -133,8 +133,7 @@ class RelayBPPaperStudy:
                 target_errors=100,
                 batch=20000,
                 max_shots=1000000,
-                parallel=True,
-                measure_time=True
+                parallel=True
             )
             
             # Add configuration info
@@ -170,8 +169,7 @@ class RelayBPPaperStudy:
                 target_errors=200,
                 batch=10_000,
                 max_shots=2_000_000,
-                parallel=True,
-                measure_time=True
+                parallel=True
             )
             output_data['config_name'] = config['name']
             output_data['max_iter'] = config['max_iter']

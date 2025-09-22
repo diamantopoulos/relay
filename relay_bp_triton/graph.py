@@ -15,24 +15,19 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from typing import Tuple, Optional
 
+from scipy.sparse import csr_matrix, issparse
 
 class CSRGraph:
-    """Edge-centric graph representation optimized for GPU kernels.
-    
-    Converts a SciPy CSR matrix to device tensors with edge-centric layout
-    for efficient message passing in belief propagation.
-    """
-    
     def __init__(self, H_csr: csr_matrix, device: str = "cuda"):
-        """Initialize graph from SciPy CSR matrix.
-        
-        Args:
-            H_csr: Binary check matrix (C x V) in CSR format
-            device: Target device ("cuda" or "rocm")
-        """
         if device == "cpu":
-            raise RuntimeError("CPU not supported - Triton kernels require GPU. Use device='cuda' or device='rocm'")
-        
+            raise RuntimeError("CPU not supported - Triton kernels require GPU. Use device='cuda' or 'rocm'")
+
+        # Accept any scipy sparse, ensure CSR matrix
+        if not issparse(H_csr):
+            raise ValueError("Input must be a scipy.sparse matrix")
+        if not isinstance(H_csr, csr_matrix):
+            H_csr = H_csr.tocsr()
+
         self.device = device
         self.C, self.V = H_csr.shape
         self.E = H_csr.nnz

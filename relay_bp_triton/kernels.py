@@ -44,10 +44,11 @@ def c2v_min_sum_kernel(
             row_end   = tl.load(chk_ptr + i + 1)
             deg = row_end - row_start
             if deg > 0:
-                # ---------- PASS 1: parity + min1/min2/argmin (vectorized) ----------
+                # ---------- PASS 1: parity + min1/min2/argmin + cnt_min1 (vectorized) ----------
                 neg_parity = tl.zeros((), dtype=tl.int32)
                 min1 = tl.full((), 1e30, dtype=tl.float32)  # fp32 for accuracy
                 min2 = tl.full((), 1e30, dtype=tl.float32)  # fp32 for accuracy
+                cnt1 = tl.zeros((), dtype=tl.int32)
                 argmin_e = tl.full((), -1,   dtype=tl.int32)
 
                 tile = row_start
@@ -57,28 +58,32 @@ def c2v_min_sum_kernel(
                     e    = tl.load(chk_edges + offs, mask=m, other=0)
                     mu_e = tl.load(mu + b*E + e,     mask=m, other=0.0)
 
-                    # parity (count negatives)
-                    neg_parity += tl.sum((mu_e < 0.0) & m, axis=0).to(tl.int32)
+                    # parity via xor of tile parity bits
+                    tile_par = (tl.sum((mu_e < 0.0) & m, axis=0).to(tl.int32) & 1)
+                    neg_parity = neg_parity ^ tile_par
 
                     a       = tl.abs(mu_e.to(tl.float32))
                     a_mask  = tl.where(m, a, 1e30)
 
-                    # tile min1 / argmin
-                    # Triton has only argmax; use -a to emulate argmin
+                    # tile min1/argmin and tie count
                     pos1    = tl.argmax(-a_mask, axis=0)
-                    min1_t  = tl.max(-a_mask, axis=0) * (-1.0)  # == min over a_mask
+                    min1_t  = tl.max(-a_mask, axis=0) * (-1.0)
                     e1_t    = tl.load(chk_edges + tile + pos1)
-
-                    # tile min2 = min over a except argmin lane
+                    cnt1_t  = tl.sum(a_mask == min1_t, axis=0).to(tl.int32)
+                    # tile min2 (mask just one occurrence of min1)
                     a_mask2 = tl.where(tl.arange(0, BLOCK_SIZE) == pos1, 1e30, a_mask)
                     min2_t  = tl.min(a_mask2, axis=0)
 
-                    # merge (global) min1/min2 with tile values
+                    # merge into global running mins and counts
                     better1 = min1_t < min1
-                    # if tile beats global min1: new min2 is min(old min1, tile min2); else include tile min1
-                    min2    = tl.where(better1, tl.minimum(min1, min2_t), tl.minimum(min2, min1_t))
-                    min1    = tl.where(better1, min1_t, min1)
-                    argmin_e= tl.where(better1, e1_t,   argmin_e)
+                    argmin_e = tl.where(better1, e1_t, argmin_e)
+                    cnt1     = tl.where(better1, cnt1_t, tl.where(min1_t == min1, cnt1 + cnt1_t, cnt1))
+                    min2     = tl.where(
+                        better1,
+                        tl.minimum(min1, min2_t),
+                        tl.where(min1_t == min1, tl.minimum(min2, min2_t), tl.minimum(min2, min1_t))
+                    )
+                    min1     = tl.where(better1, min1_t, min1)
 
                     tile += BLOCK_SIZE
 
@@ -100,8 +105,9 @@ def c2v_min_sum_kernel(
                     mu_e = tl.load(mu + b*E + e,     mask=m, other=0.0)
                     sgn_mu = tl.where(mu_e >= 0.0, 1.0, -1.0)
 
-                    is_min1_edge = (e == argmin_e)
-                    out_mag = tl.where(is_min1_edge, min2, min1)
+                    is_argmin = (e == argmin_e)
+                    use_min2  = (cnt1 == 1) & is_argmin
+                    out_mag   = tl.where(use_min2, min2, min1)
                     out_mag = tl.where(deg_is_one, 0.0, out_mag)
 
                     if use_alpha:
@@ -118,97 +124,13 @@ def c2v_min_sum_kernel(
                     tile += BLOCK_SIZE
 
 
-@triton.jit
-def sum_nu_kernel(
-    nu, var_ptr, var_edges, sum_nu,
-    B, V, E,
-    BLOCK_SIZE: tl.constexpr,
-    ROWS_PER_PROG: tl.constexpr,
-):
-    """Sum incoming ν messages per variable (no atomics)."""
-    pid = tl.program_id(axis=0)
-    base = pid * ROWS_PER_PROG
-    
-    for r in tl.static_range(0, ROWS_PER_PROG):
-        idx = base + r
-        if idx < B * V:
-            b = idx // V
-            j = idx % V
-            
-            start = tl.load(var_ptr + j)
-            end = tl.load(var_ptr + j + 1)
-            acc = tl.zeros((), dtype=tl.float32)
-            
-            tile = start
-            while tile < end:
-                offs = tile + tl.arange(0, BLOCK_SIZE)
-                m = offs < end
-                e = tl.load(var_edges + offs, mask=m, other=0)
-                nu_e = tl.load(nu + b*E + e, mask=m, other=0.0).to(tl.float32)
-                acc += tl.sum(tl.where(m, nu_e, 0.0), axis=0)
-                tile += BLOCK_SIZE
-            
-            tl.store(sum_nu + b*V + j, acc)
-
-
-@triton.jit
-def zero_sum_nu_kernel(sum_nu, B, V):
-    """Zero the sum_nu accumulator each iteration."""
-    pid = tl.program_id(axis=0)
-    b = pid // V
-    j = pid % V
-    if (b < B) & (j < V):
-        tl.store(sum_nu + b*V + j, 0.0)
-
 
 @triton.jit
 def v2c_and_marginals_kernel(
-    nu, mu,                 # [B,E]
-    var_ptr, var_edges,     # CSR over vars -> edge IDs
-    lam, M, hard_dec,       # [B,V], [B,V], [B,V]
-    B, V, E,
-    msg_is_fp16: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    nu, mu, var_ptr, var_edges, lam, M, hard_dec,
+    B, V, E, msg_is_fp16: tl.constexpr, BLOCK_SIZE: tl.constexpr,
 ):
-    """Variable-to-check and marginals kernel with proper tiling."""
-    pid = tl.program_id(axis=0)
-    b = pid // V
-    j = pid % V
-    if (b >= B) | (j >= V):
-        return
-
-    row_start = tl.load(var_ptr + j)
-    row_end   = tl.load(var_ptr + j + 1)
-    lam_bj    = tl.load(lam + b*V + j)
-
-    # PASS 1: sum incoming nu (vectorized)
-    sum_nu = tl.zeros((), dtype=tl.float32)
-    tile = row_start
-    while tile < row_end:
-        offs = tile + tl.arange(0, BLOCK_SIZE)
-        m    = offs < row_end
-        e    = tl.load(var_edges + offs, mask=m, other=0)
-        nu_e = tl.load(nu + b*E + e,     mask=m, other=0.0)
-        sum_nu += tl.sum(tl.where(m, nu_e.to(tl.float32), 0.0), axis=0)
-        tile += BLOCK_SIZE
-
-    M_bj = lam_bj + sum_nu
-    tl.store(M + b*V + j, M_bj)
-    tl.store(hard_dec + b*V + j, (M_bj < 0.0).to(tl.uint8))
-
-    # PASS 2: write mu = lam + (sum_nu - nu_e) (vectorized)
-    tile = row_start
-    while tile < row_end:
-        offs = tile + tl.arange(0, BLOCK_SIZE)
-        m    = offs < row_end
-        e    = tl.load(var_edges + offs, mask=m, other=0)
-        nu_e = tl.load(nu + b*E + e,     mask=m, other=0.0)
-        mu_e = lam_bj + (sum_nu - nu_e.to(tl.float32))  # Convert to fp32 for computation
-        if msg_is_fp16:
-            tl.store(mu + b*E + e, mu_e.to(tl.float16), mask=m)
-        else:
-            tl.store(mu + b*E + e, mu_e, mask=m)
-        tile += BLOCK_SIZE
+    return  # dead kernel removed; fused kernel is used instead
 
 
 @triton.jit
@@ -277,36 +199,67 @@ def v2c_and_marginals_fused_gamma_kernel(
 
 
 @triton.jit
-def gamma_mix_kernel(
-    lam0, M_prev, gamma, lam,
-    B, V
+def v2c_and_marginals_mu_damped_kernel(
+    nu, mu,                 # [B,E]
+    var_ptr, var_edges,     # CSR over vars -> edge IDs
+    lam, M, hard_dec,       # [B,V], [B,V], [B,V]
+    gamma,                  # [B,V]
+    B, V, E,
+    msg_is_fp16: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    ROWS_PER_PROG: tl.constexpr,
 ):
-    """Gamma mixing kernel for memory blending.
-    
-    Args:
-        lam0: [1, V] prior LLRs (broadcast across batch)
-        M_prev: [B, V] previous marginals
-        gamma: [B, V] gamma values for mixing
-        lam: [B, V] output LLRs
-        B, V: batch size, num variables
-    """
+    """Variable node update with μ damping; λ is not modified here."""
     pid = tl.program_id(axis=0)
-    b = pid // V
-    j = pid % V
-    
-    if b >= B or j >= V:
-        return
-    
-    # Load values
-    lam0_j = tl.load(lam0 + j)
-    M_bj = tl.load(M_prev + b * V + j)
-    g_bj = tl.load(gamma + b * V + j)
-    
-    # Mix: lambda = (1 - gamma) * lambda0 + gamma * M_prev
-    lam_bj = (1.0 - g_bj) * lam0_j + g_bj * M_bj
-    
-    # Store result
-    tl.store(lam + b * V + j, lam_bj)
+    base = pid * ROWS_PER_PROG
+
+    for r in tl.static_range(0, ROWS_PER_PROG):
+        idx = base + r
+        if idx < B * V:
+            b = idx // V
+            j = idx % V
+
+            row_start = tl.load(var_ptr + j)
+            row_end   = tl.load(var_ptr + j + 1)
+
+            # sum ν
+            sum_nu = tl.zeros((), dtype=tl.float32)
+            tile = row_start
+            while tile < row_end:
+                offs = tile + tl.arange(0, BLOCK_SIZE)
+                m    = offs < row_end
+                e    = tl.load(var_edges + offs, mask=m, other=0)
+                nu_e = tl.load(nu + b*E + e, mask=m, other=0.0)
+                sum_nu += tl.sum(tl.where(m, nu_e.to(tl.float32), 0.0), axis=0)
+                tile += BLOCK_SIZE
+
+            lam_bj = tl.load(lam + b*V + j)
+            M_bj = lam_bj + sum_nu
+            tl.store(M + b*V + j, M_bj)
+            tl.store(hard_dec + b*V + j, (M_bj < 0.0).to(tl.uint8))
+
+            g_bj = tl.load(gamma + b*V + j)
+
+            # write μ with damping
+            tile = row_start
+            while tile < row_end:
+                offs = tile + tl.arange(0, BLOCK_SIZE)
+                m    = offs < row_end
+                e    = tl.load(var_edges + offs, mask=m, other=0)
+                nu_e = tl.load(nu + b*E + e, mask=m, other=0.0)
+                mu_out = lam_bj + (sum_nu - nu_e.to(tl.float32))
+                mu_prev = tl.load(mu + b*E + e, mask=m, other=0.0).to(tl.float32)
+                mu_new = (1.0 - g_bj) * mu_prev + g_bj * mu_out
+                if msg_is_fp16:
+                    tl.store(mu + b*E + e, mu_new.to(tl.float16), mask=m)
+                else:
+                    tl.store(mu + b*E + e, mu_new, mask=m)
+                tile += BLOCK_SIZE
+
+
+@triton.jit
+def gamma_mix_kernel(lam0, M_prev, gamma, lam, B, V):
+    return  # dead kernel removed; fused kernel is used instead
 
 
 @triton.jit
@@ -492,63 +445,12 @@ class KernelAutotuner:
         return config
 
 
-@triton.jit
-def marginals_and_gamma_kernel(
-    sum_nu, lam, M, hard_dec, lam0, gamma,
-    B, V,
-    WRITE_HARD: tl.constexpr  # only set True when you'll run parity
-):
-    """Per-variable marginals and gamma mixing kernel (contiguous access)."""
-    pid = tl.program_id(axis=0)
-    b = pid // V
-    j = pid % V
-    if (b >= B) | (j >= V):
-        return
-
-    lam_bj = tl.load(lam + b*V + j)
-    s = tl.load(sum_nu + b*V + j)
-    M_bj = lam_bj + s
-    tl.store(M + b*V + j, M_bj)        # needed for weights / optional for parity cadence
-
-    if WRITE_HARD:
-        tl.store(hard_dec + b*V + j, (M_bj < 0.0).to(tl.uint8))
-
-    g = tl.load(gamma + b*V + j)
-    lam0_j = tl.load(lam0 + j)
-    lam_new = (1.0 - g) * lam0_j + g * M_bj
-    tl.store(lam + b*V + j, lam_new)
 
 
-@triton.jit
-def edge_update_mu_kernel(
-    nu, mu, edge_var, lam, sum_nu,
-    B, V, E,
-    msg_is_fp16: tl.constexpr,
-    EDGES_PER_PROG: tl.constexpr   # e.g. 256
-):
-    """Edge-parallel μ update kernel with contiguous access."""
-    pid = tl.program_id(axis=0)
-    tiles_per_b = (E + EDGES_PER_PROG - 1) // EDGES_PER_PROG
-    b = pid // tiles_per_b
-    t = pid % tiles_per_b
-    if b >= B:
-        return
 
-    start = t * EDGES_PER_PROG
-    offs = start + tl.arange(0, EDGES_PER_PROG)
-    m = offs < E
-    e = offs
 
-    v = tl.load(edge_var + e, mask=m, other=0)
-    lam_bv = tl.load(lam + b*V + v, mask=m, other=0.0)
-    s_bv = tl.load(sum_nu + b*V + v, mask=m, other=0.0)
-    nu_be = tl.load(nu + b*E + e, mask=m, other=0.0)
 
-    mu_be = lam_bv + (s_bv - nu_be)
-    if msg_is_fp16:
-        tl.store(mu + b*E + e, mu_be.to(tl.float16), mask=m)
-    else:
-        tl.store(mu + b*E + e, mu_be, mask=m)
+
 
 
 @triton.jit
@@ -630,6 +532,7 @@ def c2v_min_sum_btile_kernel(
     neg_parity = tl.zeros((BTILE,), dtype=tl.int32)
     min1 = tl.full((BTILE,), 1e30, dtype=tl.float32)
     min2 = tl.full((BTILE,), 1e30, dtype=tl.float32)
+    cnt1 = tl.zeros((BTILE,), dtype=tl.int32)
 
     # PASS 1: compute min1/min2 and parity per batch lane
     tile = row_start
@@ -640,17 +543,22 @@ def c2v_min_sum_btile_kernel(
         # Build 2D mask and gather mu over edges×BTILE
         mask2d = (mrow[:, None]) & (mb[None, :])
         mu_tile = tl.load(muT + (evec[:, None]) * B + bs[None, :], mask=mask2d, other=0.0)  # [BLOCK_SIZE, BTILE]
-        neg_parity += tl.sum((mu_tile < 0.0) & mask2d, axis=0).to(tl.int32)
+        # tile parity via xor of tile parity bits
+        tile_par = (tl.sum((mu_tile < 0.0) & mask2d, axis=0).to(tl.int32) & 1)
+        neg_parity = neg_parity ^ tile_par
         a = tl.abs(mu_tile.to(tl.float32))
         a = tl.where(mask2d, a, 1e30)
-        # min1 over edges
+        # min1 over edges and tie count
         min1_t = tl.min(a, axis=0)
-        # min2: mask min1 entries, then min again
-        a2 = tl.where(a == min1_t, 1e30, a)
+        cnt1_t = tl.sum(a == min1_t[None, :], axis=0).to(tl.int32)
+        # min2: mask a single occurrence along edge axis
+        pos1   = tl.argmax(-a, axis=0)
+        a2     = tl.where(tl.arange(0, BLOCK_SIZE)[:, None] == pos1[None, :], 1e30, a)
         min2_t = tl.min(a2, axis=0)
-        # merge with running min1/min2
+        # merge with running min1/min2 and counts
         better1 = min1_t < min1
-        min2 = tl.where(better1, tl.minimum(min1, min2_t), tl.minimum(min2, min1_t))
+        cnt1 = tl.where(better1, cnt1_t, tl.where(min1_t == min1, cnt1 + cnt1_t, cnt1))
+        min2 = tl.where(better1, tl.minimum(min1, min2_t), tl.where(min1_t == min1, tl.minimum(min2, min2_t), tl.minimum(min2, min1_t)))
         min1 = tl.where(better1, min1_t, min1)
         tile += BLOCK_SIZE
 
@@ -668,11 +576,12 @@ def c2v_min_sum_btile_kernel(
         mask2d = (mrow[:, None]) & (mb[None, :])
         mu_tile = tl.load(muT + (evec[:, None]) * B + bs[None, :], mask=mask2d, other=0.0)
         sgn = tl.where(mu_tile >= 0.0, 1.0, -1.0)
-        # Identify min1 lanes per edge×batch
+        # Identify min1 lanes per edge×batch and apply correct tie logic
         a = tl.abs(mu_tile.to(tl.float32))
         a_mask = tl.where(mask2d, a, 1e30)
-        is_min1 = a_mask == min1[None, :]
-        out_mag = tl.where(is_min1, min2[None, :], min1[None, :])
+        is_min1 = (a_mask == min1[None, :])
+        use_min2 = (cnt1[None, :] == 1) & is_min1
+        out_mag = tl.where(use_min2, min2[None, :], min1[None, :])
         out_mag = tl.where(deg_is_one, 0.0, out_mag)
         if use_alpha:
             out_mag = alpha * out_mag

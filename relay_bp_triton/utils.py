@@ -178,30 +178,25 @@ def validate_error_priors(error_priors: np.ndarray) -> np.ndarray:
 
 
 def validate_csr_matrix(H_csr) -> bool:
-    """Validate CSR matrix format and properties.
-    
-    Args:
-        H_csr: scipy.sparse.csr_matrix
-        
-    Returns:
-        True if valid
-    """
-    from scipy.sparse import csr_matrix
-    
+    """Validate CSR matrix format and properties; coerce CSR if needed."""
+    from scipy.sparse import csr_matrix, issparse
+
+    if not issparse(H_csr):
+        raise ValueError("Input must be a scipy.sparse matrix (any format)")
+
+    # Coerce to CSR if it's e.g. csr_array/coo/csc/etc.
     if not isinstance(H_csr, csr_matrix):
-        raise ValueError("Input must be a scipy.sparse.csr_matrix")
-    
+        H_csr = H_csr.tocsr()
+
     if H_csr.shape[0] == 0 or H_csr.shape[1] == 0:
         raise ValueError("Matrix cannot be empty")
-    
     if H_csr.nnz == 0:
         raise ValueError("Matrix cannot have zero non-zero elements")
-    
-    # Check for binary values
     if not np.all((H_csr.data == 0) | (H_csr.data == 1)):
-        print("Warning: Matrix contains non-binary values, will be converted to binary")
-    
+        print("Warning: Matrix contains non-binary values, will be treated as binary")
+
     return True
+
 
 
 def get_device_info(device: str) -> dict:

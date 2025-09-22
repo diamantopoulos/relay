@@ -18,8 +18,8 @@ import os
 
 from .graph import CSRGraph
 from .kernels import (
-    c2v_min_sum_kernel, v2c_and_marginals_kernel, v2c_and_marginals_fused_gamma_kernel,
-    gamma_mix_kernel, parity_per_check_kernel, init_messages_kernel, stop_flag_kernel, get_autotuner,
+    c2v_min_sum_kernel, v2c_and_marginals_fused_gamma_kernel,
+    parity_per_check_kernel, init_messages_kernel, stop_flag_kernel, get_autotuner,
     be_to_eb_kernel, eb_to_be_kernel, c2v_min_sum_btile_kernel, v2c_and_gamma_btile_kernel,
     relay_decode_persistent_kernel,
 )
@@ -153,7 +153,7 @@ class RelayBPDecoder:
         self._device_tensors = {}
         
         # Constants for device-driven early exit
-        self.CHECK_EVERY = 16  # Check stop flag every N iterations
+        self.CHECK_EVERY = 1  # Check stop flag every N iterations
         
         # Constants for kernel batching (reduce launch overhead)
         self.ROWS_PER_PROG_C2V = 8  # Number of rows per C2V program
@@ -351,20 +351,8 @@ class RelayBPDecoder:
         )
     
     def _launch_v2c_kernel(self, tensors: Dict, B: int):
-        """Launch variable-to-check and marginals kernel."""
-        grid = (B * self.V,)
-        msg_is_fp16 = (self.msg_dtype == torch.float16)
-        
-        v2c_and_marginals_kernel[grid](
-            tensors['nu'], tensors['mu'],
-            self.graph.var_ptr, self.graph.var_edges,
-            tensors['lambda_'], tensors['M'], tensors['hard_dec'],
-            B, self.V, self.E,
-            msg_is_fp16,
-            self.v2c_config['BLOCK_SIZE'],
-            num_warps=self.v2c_config['num_warps'],
-            num_stages=self.v2c_config['num_stages']
-        )
+        """Deprecated: plain V2C path removed (use fused)."""
+        pass
     
     def _launch_v2c_fused_gamma_kernel(self, tensors: Dict, B: int):
         """Launch variable-to-check and marginals kernel with fused gamma mixing."""
@@ -387,14 +375,8 @@ class RelayBPDecoder:
         )
     
     def _launch_gamma_mix_kernel(self, tensors: Dict, B: int):
-        """Launch gamma mixing kernel."""
-        grid = (B * self.V,)
-        
-        gamma_mix_kernel[grid](
-            self.lambda0, tensors['M'], tensors['gamma'],
-            tensors['lambda_'],
-            B, self.V
-        )
+        """Deprecated: gamma mixing handled in fused V2C kernel."""
+        pass
     
     def _launch_parity_check_kernel(self, tensors: Dict, B: int):
         """Launch parity check kernel."""
@@ -524,6 +506,7 @@ class RelayBPDecoder:
                 self._launch_v2c_btile(tensors, B, write_hard=((t+1) % self.CHECK_EVERY == 0))
             else:
                 self._launch_c2v_kernel(tensors, B)
+                # Fused V2C + gamma mixing updates lambda_ internally
                 self._launch_v2c_fused_gamma_kernel(tensors, B)
 
             if (t + 1) % self.CHECK_EVERY == 0:
@@ -545,7 +528,7 @@ class RelayBPDecoder:
             
             for t in range(self.set_max_iter):
                 self._launch_c2v_kernel(tensors, B)                  # produces ν
-                self._launch_v2c_fused_gamma_kernel(tensors, B)      # V2C + gamma mixing (no atomics)
+                self._launch_v2c_fused_gamma_kernel(tensors, B)
                 
                 # Check parity and select solutions only every CHECK_EVERY iterations
                 if (t + 1) % self.CHECK_EVERY == 0:
@@ -561,10 +544,16 @@ class RelayBPDecoder:
                 break
         
         # Prepare output
+        # Fallback: if no valid solution was found for a batch item, use the last hard decision
+        fallback_errors = torch.where(
+            tensors['valid_solutions'].view(-1, 1),
+            tensors['best_errors'],
+            tensors['hard_dec'],
+        )
         if self.bitpack_output:
-            errors = bitpack_errors(tensors['best_errors'])
+            errors = bitpack_errors(fallback_errors)
         else:
-            errors = tensors['best_errors']
+            errors = fallback_errors
         
         return {
             "errors": errors,
