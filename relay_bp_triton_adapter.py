@@ -64,13 +64,14 @@ class RelayDecoderF64:
         out = self._dec.decode(s)
         bits = out["errors"][0].to(torch.int8)
         converged = bool(out["valid_mask"][0].item())
-        # Iterations proxy: use pre_iter (legs not exposed yet)
+        # Real iterations reported by the Triton decoder
+        iters = int(out.get("iterations", torch.tensor([self._dec.pre_iter], device=self._dec.device))[0].item())
         return {
             "bits": bits,
             "posterior_llr": None,
             "converged": converged,
             "num_ensembles": 0,
-            "iterations": int(self._dec.pre_iter),
+            "iterations": iters,
             "selected_idx": 0,
         }
 
@@ -114,6 +115,7 @@ class ObservableDecoderRunner:
         S_gpu = torch.from_numpy(S).to(self.decoder._dec.device)
         out = self.decoder._dec.decode(S_gpu)
         bits = out["errors"].to(torch.uint8).cpu().numpy()  # (B,V)
+        iters = out.get("iterations", torch.full((B,), int(self.decoder._dec.pre_iter), device=self.decoder._dec.device, dtype=torch.int32)).to(torch.int32).cpu().numpy()
         pred_obs = self._mul_mod2(self._obs, bits.T).T
 
         res: List[_ObsResult] = []
@@ -121,7 +123,7 @@ class ObservableDecoderRunner:
         for i in range(B):
             err_det = bool((true_obs[i] != pred_obs[i]).any())
             res.append(_ObsResult(
-                iterations=int(self.decoder._dec.pre_iter),  # pre_iter + legs if exposed later
+                iterations=int(iters[i]),
                 converged=bool(valid[i]),
                 error_detected=err_det,
                 observables=pred_obs[i].astype(np.uint8),

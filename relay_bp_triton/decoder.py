@@ -54,6 +54,7 @@ class RelayBPDecoder:
         seed: int = 1234,
         bitpack_output: bool = False,
         mode: str = "default",  # "default" or "throughput"
+        alpha_iteration_scaling_factor: Optional[float] = 1.0,
     ):
         """Initialize Relay-BP decoder.
         
@@ -102,6 +103,7 @@ class RelayBPDecoder:
         self.seed = seed
         self.bitpack_output = bitpack_output
         self.mode = mode
+        self.alpha_iteration_scaling_factor = float(alpha_iteration_scaling_factor or 1.0)
         
         # Set up device
         if device == "cuda" and not torch.cuda.is_available():
@@ -119,11 +121,11 @@ class RelayBPDecoder:
         log_ratios = compute_log_prior_ratios(error_priors)
         self.lambda0 = torch.from_numpy(log_ratios).to(device).unsqueeze(0)  # [1, V]
         
-        # Precompute weights once (avoid recomputing each loop)
-        self.wj = torch.log(
-            (1.0 - torch.from_numpy(self.error_priors).to(self.device, dtype=torch.float32))
-            / torch.from_numpy(self.error_priors).to(self.device, dtype=torch.float32)
-        ).contiguous()  # [V], device
+        # Precompute weights once (avoid recomputing each loop): match Rust decoding_quality
+        # Use sum of log-priors over bits==1, ignoring infs
+        wj = torch.abs(self.lambda0.squeeze(0)).to(self.device, dtype=torch.float32)  # [V]
+        wj = torch.where(torch.isfinite(wj), wj, torch.zeros_like(wj))
+        self.wj = wj.contiguous()
         
         # Set up message dtype (fp16 for messages, fp32 for accumulations)
         if dtype_messages == "fp16":
@@ -181,6 +183,7 @@ class RelayBPDecoder:
             # Beliefs (fp32 for accuracy)
             'lambda_': torch.zeros(B, self.V, dtype=self.acc_dtype, device=self.device),
             'M': torch.zeros(B, self.V, dtype=self.acc_dtype, device=self.device),
+            'M_prev': torch.zeros(B, self.V, dtype=self.acc_dtype, device=self.device),
             'hard_dec': torch.zeros(B, self.V, dtype=torch.uint8, device=self.device),
             
             # Gamma (fp32 for accuracy)
@@ -327,7 +330,8 @@ class RelayBPDecoder:
     
     def _launch_c2v_kernel(self, tensors: Dict, B: int):
         """Launch check-to-variable kernel."""
-        alpha = self.normalized_min_sum_alpha or 0.0
+        # alpha is set per-iteration via self._alpha_t and written to an attribute before launch
+        alpha = getattr(self, "_alpha_current", self.normalized_min_sum_alpha or 0.0)
         beta = self.offset_min_sum_beta or 0.0
         use_alpha = self.normalized_min_sum_alpha is not None
         use_beta = self.offset_min_sum_beta is not None
@@ -340,7 +344,7 @@ class RelayBPDecoder:
         c2v_min_sum_kernel[grid](
             tensors['mu'], tensors['nu'],
             self.graph.chk_ptr, self.graph.chk_edges,
-            tensors['syndrome'],                      # pass syndrome here
+            tensors['syndrome'], tensors['active'],   # pass syndrome and active lanes
             B, self.C, self.E,
             alpha, beta, use_alpha, use_beta,
             msg_is_fp16,
@@ -363,12 +367,13 @@ class RelayBPDecoder:
         v2c_and_marginals_fused_gamma_kernel[grid](
             tensors['nu'], tensors['mu'],
             self.graph.var_ptr, self.graph.var_edges,
-            tensors['lambda_'], tensors['M'], tensors['hard_dec'],
+            tensors['lambda_'], tensors['M'], tensors['M_prev'], tensors['hard_dec'],
+            tensors['active'],
             self.lambda0, tensors['gamma'],
             B, self.V, self.E,
             msg_is_fp16,
             self.v2c_config['BLOCK_SIZE'],
-            STORE_M=False,  # Don't spill M each iter for bandwidth optimization
+            STORE_M=True,  # Store M so M_prev can be updated for next iter
             ROWS_PER_PROG=self.ROWS_PER_PROG_V2C,
             num_warps=self.v2c_config['num_warps'],
             num_stages=self.v2c_config['num_stages']
@@ -421,7 +426,8 @@ class RelayBPDecoder:
             tensors['nuT'], tensors['muT'],
             self.graph.var_ptr, self.graph.var_edges,
             tensors['lambda_'], self.lambda0, tensors['gamma'],
-            tensors['M'], tensors['hard_dec'],
+            tensors['M'], tensors['M_prev'], tensors['hard_dec'],
+            tensors['active'],
             B, self.V, self.E,
             msg_is_fp16,
             self.v2c_config['BLOCK_SIZE'],
@@ -477,12 +483,24 @@ class RelayBPDecoder:
         
         # Allocate device tensors
         tensors = self._allocate_device_tensors(B)
+        # One-time allocations for per-lane freezing and iteration accounting
+        if 'first_iter' not in tensors:
+            tensors['first_iter'] = torch.full((B,), -1, dtype=torch.int32, device=self.device)
+        if 'frozen_errors' not in tensors:
+            tensors['frozen_errors'] = torch.zeros(B, self.V, dtype=torch.uint8, device=self.device)
+        if 'iter_counter' not in tensors:
+            tensors['iter_counter'] = torch.zeros((), dtype=torch.int32, device=self.device)
+        if 'active' not in tensors:
+            tensors['active'] = torch.ones(B, dtype=torch.uint8, device=self.device)
+        # Reset active lanes at the start of every decode
+        tensors['active'].fill_(1)
         
         # Copy syndromes to device
         tensors['syndrome'][:] = syndromes
         
         # Initialize
         tensors['lambda_'][:] = self.lambda0  # Broadcast prior LLRs
+        tensors['M_prev'][:]  = self.lambda0  # Seed previous marginals for t=0 mix
         tensors['best_weights'].fill_(float('inf'))
         tensors['found_count'].zero_()
         tensors['valid_solutions'].zero_()
@@ -500,6 +518,18 @@ class RelayBPDecoder:
             self._be_to_eb(tensors['nu'], tensors['nuT'], B)
 
         for t in range(self.pre_iter):
+            # Compute Rust-like alpha schedule when alpha==0.0
+            if self.normalized_min_sum_alpha is None:
+                self._alpha_current = 0.0
+            else:
+                a = float(self.normalized_min_sum_alpha)
+                if a == 0.0:
+                    s = float(self.alpha_iteration_scaling_factor or 1.0)
+                    self._alpha_current = 1.0 - (2.0 ** (-( (t + 1) / s )))
+                elif a < 0.0:
+                    self._alpha_current = 1.0
+                else:
+                    self._alpha_current = a
             if self.mode == "throughput":
                 # BTILE C2V and V2C fully in [E,B]
                 self._launch_c2v_btile(tensors, B)
@@ -508,12 +538,27 @@ class RelayBPDecoder:
                 self._launch_c2v_kernel(tensors, B)
                 # Fused V2C + gamma mixing updates lambda_ internally
                 self._launch_v2c_fused_gamma_kernel(tensors, B)
+                # M_prev <- M (for next iteration's mixing)
+                tensors['M_prev'].copy_(tensors['M'])
 
             if (t + 1) % self.CHECK_EVERY == 0:
                 # For parity path, we need hard_dec updated (done in v2c btile when write_hard=True)
                 self._check_parity_and_select(tensors, B)
-                self._launch_stop_flag_kernel(tensors, B)
-                if tensors['stop_flag'].item():
+                # Host-side per-lane freezing and exit
+                done_now = tensors['found_count'] >= self.stop_nconv  # [B]
+                newly_done = done_now & (tensors['first_iter'] < 0)
+                # capture first-done iteration index and snapshot winning errors
+                if torch.any(newly_done):
+                    tensors['first_iter'][newly_done] = tensors['iter_counter']
+                    tensors['frozen_errors'][newly_done] = tensors['best_errors'][newly_done]
+                # freeze finished lanes
+                tensors['active'][done_now] = 0
+                tensors['gamma'][done_now] = 0.0
+                tensors['hard_dec'][done_now] = tensors['frozen_errors'][done_now]
+                # advance global iteration counter
+                tensors['iter_counter'] += 1
+                # exit if all lanes done
+                if bool(done_now.all()):
                     break
         
         # Final parity check after pre-iterations
@@ -527,14 +572,35 @@ class RelayBPDecoder:
             tensors['gamma'][:] = gamma_leg
             
             for t in range(self.set_max_iter):
+                # Per-iter alpha schedule
+                if self.normalized_min_sum_alpha is None:
+                    self._alpha_current = 0.0
+                else:
+                    a = float(self.normalized_min_sum_alpha)
+                    if a == 0.0:
+                        s = float(self.alpha_iteration_scaling_factor or 1.0)
+                        self._alpha_current = 1.0 - (2.0 ** (-( (t + 1) / s )))
+                    elif a < 0.0:
+                        self._alpha_current = 1.0
+                    else:
+                        self._alpha_current = a
                 self._launch_c2v_kernel(tensors, B)                  # produces ν
                 self._launch_v2c_fused_gamma_kernel(tensors, B)
+                tensors['M_prev'].copy_(tensors['M'])
                 
                 # Check parity and select solutions only every CHECK_EVERY iterations
                 if (t + 1) % self.CHECK_EVERY == 0:
                     self._check_parity_and_select(tensors, B)
-                    self._launch_stop_flag_kernel(tensors, B)
-                    if tensors['stop_flag'].item():  # One tiny sync occasionally
+                    done_now = tensors['found_count'] >= self.stop_nconv
+                    newly_done = done_now & (tensors['first_iter'] < 0)
+                    if torch.any(newly_done):
+                        tensors['first_iter'][newly_done] = tensors['iter_counter']
+                        tensors['frozen_errors'][newly_done] = tensors['best_errors'][newly_done]
+                    tensors['active'][done_now] = 0
+                    tensors['gamma'][done_now] = 0.0
+                    tensors['hard_dec'][done_now] = tensors['frozen_errors'][done_now]
+                    tensors['iter_counter'] += 1
+                    if bool(done_now.all()):
                         break
             
             # Final parity check and stop flag after each leg
@@ -555,10 +621,15 @@ class RelayBPDecoder:
         else:
             errors = fallback_errors
         
+        # Build per-lane iteration counts (Rust-like): first_iter if set, else total iter_counter
+        iters = tensors['first_iter'].clone()
+        iters = torch.where(iters >= 0, iters, tensors['iter_counter'].expand_as(iters))
+
         return {
             "errors": errors,
             "weights": tensors['best_weights'],
-            "valid_mask": tensors['valid_solutions']
+            "valid_mask": tensors['valid_solutions'],
+            "iterations": iters,
         }
     
     def get_stats(self) -> Dict:

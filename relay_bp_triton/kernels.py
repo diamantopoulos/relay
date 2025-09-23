@@ -21,6 +21,7 @@ def c2v_min_sum_kernel(
     mu, nu,                    # [B,E]
     chk_ptr, chk_edges,        # CSR over checks -> edge IDs
     syndrome,                  # [B,C]
+    active,                    # [B] uint8 mask (1=active, 0=frozen)
     B, C, E,
     alpha, beta,
     use_alpha: tl.constexpr, use_beta: tl.constexpr,
@@ -40,9 +41,13 @@ def c2v_min_sum_kernel(
             b = idx // C
             i = idx % C
 
+            # Per-lane active mask
+            act_b = tl.load(active + b)
             row_start = tl.load(chk_ptr + i)
             row_end   = tl.load(chk_ptr + i + 1)
             deg = row_end - row_start
+            # If inactive, force deg=0 to skip work
+            deg = tl.where(act_b == 0, 0, deg)
             if deg > 0:
                 # ---------- PASS 1: parity + min1/min2/argmin + cnt_min1 (vectorized) ----------
                 neg_parity = tl.zeros((), dtype=tl.int32)
@@ -87,9 +92,6 @@ def c2v_min_sum_kernel(
 
                     tile += BLOCK_SIZE
 
-                # degree-1: outgoing magnitude must be 0
-                deg_is_one = (deg == 1)
-                
                 # include syndrome bit in sign product
                 syn = tl.load(syndrome + b*C + i).to(tl.int32) & 1
                 # parity bit = (neg_parity & 1) XOR syn
@@ -108,7 +110,6 @@ def c2v_min_sum_kernel(
                     is_argmin = (e == argmin_e)
                     use_min2  = (cnt1 == 1) & is_argmin
                     out_mag   = tl.where(use_min2, min2, min1)
-                    out_mag = tl.where(deg_is_one, 0.0, out_mag)
 
                     if use_alpha:
                         out_mag = alpha * out_mag
@@ -137,7 +138,8 @@ def v2c_and_marginals_kernel(
 def v2c_and_marginals_fused_gamma_kernel(
     nu, mu,                 # [B,E]
     var_ptr, var_edges,     # CSR over vars -> edge IDs
-    lam, M, hard_dec,       # [B,V], [B,V], [B,V]
+    lam, M, M_prev, hard_dec,  # [B,V], [B,V], [B,V], [B,V]
+    active,                    # [B] uint8 mask (1=active)
     lam0, gamma,            # [1,V], [B,V] - for gamma mixing
     B, V, E,
     msg_is_fp16: tl.constexpr,
@@ -157,9 +159,13 @@ def v2c_and_marginals_fused_gamma_kernel(
             b = idx // V
             j = idx % V
 
+            # Per-lane active mask
+            act_b = tl.load(active + b)
             row_start = tl.load(var_ptr + j)
             row_end   = tl.load(var_ptr + j + 1)
             lam_bj    = tl.load(lam + b*V + j)
+            # If inactive, set row range empty to skip work
+            row_end = tl.where(act_b == 0, row_start, row_end)
 
             # PASS 1: sum incoming nu (vectorized)
             sum_nu = tl.zeros((), dtype=tl.float32)
@@ -172,15 +178,16 @@ def v2c_and_marginals_fused_gamma_kernel(
                 sum_nu += tl.sum(tl.where(m, nu_e.to(tl.float32), 0.0), axis=0)
                 tile += BLOCK_SIZE
 
-            M_bj = lam_bj + sum_nu
+            M_bj_curr = lam_bj + sum_nu
             if STORE_M:
-                tl.store(M + b*V + j, M_bj)  # Only store if needed
-            tl.store(hard_dec + b*V + j, (M_bj < 0.0).to(tl.uint8))
+                tl.store(M + b*V + j, M_bj_curr)  # Only store if needed
+            tl.store(hard_dec + b*V + j, (M_bj_curr < 0.0).to(tl.uint8))
 
-            # FUSED GAMMA MIXING: lam = (1-γ)*λ0 + γ*M (fp32 computation)
+            # FUSED GAMMA MIXING with PREVIOUS marginals: lam = (1-γ)*λ0 + γ*M_prev
             g_bj = tl.load(gamma + b*V + j)           # [B,V]
             lam0_j = tl.load(lam0 + j)                # [1,V]
-            lam_bj_new = (1.0 - g_bj) * lam0_j + g_bj * M_bj
+            M_bj_prev = tl.load(M_prev + b*V + j)
+            lam_bj_new = (1.0 - g_bj) * lam0_j + g_bj * M_bj_prev
             tl.store(lam + b*V + j, lam_bj_new)
 
             # PASS 2: write mu = lam + (sum_nu - nu_e) using NEW lam (vectorized)
@@ -505,6 +512,7 @@ def c2v_min_sum_btile_kernel(
     muT, nuT,                 # [E,B]
     chk_ptr, chk_edges,       # CSR over checks -> edge IDs
     syndrome,                 # [B,C] (uint8)
+    active,                   # [B] uint8 mask
     B, C, E,
     alpha, beta,
     use_alpha: tl.constexpr, use_beta: tl.constexpr,
@@ -521,6 +529,8 @@ def c2v_min_sum_btile_kernel(
     b0 = btile_id * BTILE
     bs = b0 + tl.arange(0, BTILE)
     mb = bs < B
+    active_bs = tl.load(active + bs, mask=mb, other=0)
+    mb_act = mb & (active_bs != 0)
 
     row_start = tl.load(chk_ptr + i)
     row_end   = tl.load(chk_ptr + i + 1)
@@ -541,7 +551,7 @@ def c2v_min_sum_btile_kernel(
         mrow = offs < row_end
         evec = tl.load(chk_edges + offs, mask=mrow, other=0)             # [BLOCK_SIZE]
         # Build 2D mask and gather mu over edges×BTILE
-        mask2d = (mrow[:, None]) & (mb[None, :])
+        mask2d = (mrow[:, None]) & (mb_act[None, :])
         mu_tile = tl.load(muT + (evec[:, None]) * B + bs[None, :], mask=mask2d, other=0.0)  # [BLOCK_SIZE, BTILE]
         # tile parity via xor of tile parity bits
         tile_par = (tl.sum((mu_tile < 0.0) & mask2d, axis=0).to(tl.int32) & 1)
@@ -562,8 +572,7 @@ def c2v_min_sum_btile_kernel(
         min1 = tl.where(better1, min1_t, min1)
         tile += BLOCK_SIZE
 
-    deg_is_one = (deg == 1)
-    syn = tl.load(syndrome + bs * C + i, mask=mb, other=0).to(tl.int32) & 1
+    syn = tl.load(syndrome + bs * C + i, mask=mb_act, other=0).to(tl.int32) & 1
     par_bit = ((neg_parity & 1) ^ syn)
     sign_prod = tl.where(par_bit == 0, 1.0, -1.0)
 
@@ -573,7 +582,7 @@ def c2v_min_sum_btile_kernel(
         offs = tile + tl.arange(0, BLOCK_SIZE)
         mrow = offs < row_end
         evec = tl.load(chk_edges + offs, mask=mrow, other=0)
-        mask2d = (mrow[:, None]) & (mb[None, :])
+        mask2d = (mrow[:, None]) & (mb_act[None, :])
         mu_tile = tl.load(muT + (evec[:, None]) * B + bs[None, :], mask=mask2d, other=0.0)
         sgn = tl.where(mu_tile >= 0.0, 1.0, -1.0)
         # Identify min1 lanes per edge×batch and apply correct tie logic
@@ -582,7 +591,6 @@ def c2v_min_sum_btile_kernel(
         is_min1 = (a_mask == min1[None, :])
         use_min2 = (cnt1[None, :] == 1) & is_min1
         out_mag = tl.where(use_min2, min2[None, :], min1[None, :])
-        out_mag = tl.where(deg_is_one, 0.0, out_mag)
         if use_alpha:
             out_mag = alpha * out_mag
         if use_beta:
@@ -600,7 +608,8 @@ def v2c_and_gamma_btile_kernel(
     nuT, muT,                 # [E,B]
     var_ptr, var_edges,       # CSR over vars -> edge IDs
     lam, lam0, gamma,         # [B,V], [V], [B,V]
-    M, hard_dec,              # [B,V], [B,V]
+    M, M_prev, hard_dec,      # [B,V], [B,V], [B,V]
+    active,                   # [B] uint8 mask
     B, V, E,
     msg_is_fp16: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -617,6 +626,8 @@ def v2c_and_gamma_btile_kernel(
     b0 = btile_id * BTILE
     bs = b0 + tl.arange(0, BTILE)
     mb = bs < B
+    active_bs = tl.load(active + bs, mask=mb, other=0)
+    mb_act = mb & (active_bs != 0)
 
     row_start = tl.load(var_ptr + j)
     row_end   = tl.load(var_ptr + j + 1)
@@ -628,21 +639,22 @@ def v2c_and_gamma_btile_kernel(
         offs = tile + tl.arange(0, BLOCK_SIZE)
         mrow = offs < row_end
         evec = tl.load(var_edges + offs, mask=mrow, other=0)                 # [BLOCK_SIZE]
-        mask2d = (mrow[:, None]) & (mb[None, :])
+        mask2d = (mrow[:, None]) & (mb_act[None, :])
         nu_tile = tl.load(nuT + (evec[:, None]) * B + bs[None, :], mask=mask2d, other=0.0)
         sum_nu += tl.sum(tl.where(mask2d, nu_tile.to(tl.float32), 0.0), axis=0)
         tile += BLOCK_SIZE
 
     # beliefs and gamma mix (fp32 compute)
-    lam_bj = tl.load(lam + bs * V + j, mask=mb, other=0.0)
+    lam_bj = tl.load(lam + bs * V + j, mask=mb_act, other=0.0)
     M_bj = lam_bj + sum_nu
-    tl.store(M + bs * V + j, M_bj, mask=mb)
+    tl.store(M + bs * V + j, M_bj, mask=mb_act)
     if WRITE_HARD:
-        tl.store(hard_dec + bs * V + j, (M_bj < 0.0).to(tl.uint8), mask=mb)
-    g_bj = tl.load(gamma + bs * V + j, mask=mb, other=0.0)
+        tl.store(hard_dec + bs * V + j, (M_bj < 0.0).to(tl.uint8), mask=mb_act)
+    g_bj = tl.load(gamma + bs * V + j, mask=mb_act, other=0.0)
     lam0_j = tl.load(lam0 + j)
-    lam_new = (1.0 - g_bj) * lam0_j + g_bj * M_bj
-    tl.store(lam + bs * V + j, lam_new, mask=mb)
+    M_prev_bj = tl.load(M_prev + bs * V + j, mask=mb_act, other=0.0)
+    lam_new = (1.0 - g_bj) * lam0_j + g_bj * M_prev_bj
+    tl.store(lam + bs * V + j, lam_new, mask=mb_act)
 
     # write muT for each edge lane (vectorized)
     tile = row_start
@@ -650,7 +662,7 @@ def v2c_and_gamma_btile_kernel(
         offs = tile + tl.arange(0, BLOCK_SIZE)
         mrow = offs < row_end
         evec = tl.load(var_edges + offs, mask=mrow, other=0)
-        mask2d = (mrow[:, None]) & (mb[None, :])
+        mask2d = (mrow[:, None]) & (mb_act[None, :])
         nu_tile = tl.load(nuT + (evec[:, None]) * B + bs[None, :], mask=mask2d, other=0.0)
         mu_tile = lam_new[None, :] + (sum_nu[None, :] - nu_tile.to(tl.float32))
         if msg_is_fp16:
