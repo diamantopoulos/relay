@@ -109,7 +109,7 @@ class RelayBPPaperStudy:
     def define_plain_bp_grid(self):
         # Sweep plain BP (no memory, no relay) by max_iter and backend to populate x-axis
         max_iter_values = [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 200, 300, 500, 600, 700, 800, 900, 1000]
-        backends = ['rust', 'triton']
+        backends = ['triton']
         configs = []
         for backend in backends:
             for tmax in max_iter_values:

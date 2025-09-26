@@ -496,6 +496,10 @@ class RelayBPDecoder:
             tensors['active'] = torch.ones(B, dtype=torch.uint8, device=self.device)
         # Reset active lanes at the start of every decode
         tensors['active'].fill_(1)
+        # Reset per-decode iteration accounting and frozen state
+        tensors['first_iter'].fill_(-1)
+        tensors['frozen_errors'].zero_()
+        tensors['iter_counter'].zero_()
         
         # Copy syndromes to device
         tensors['syndrome'][:] = syndromes
