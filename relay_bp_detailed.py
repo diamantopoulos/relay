@@ -25,10 +25,6 @@ import json
 
 def _select_backend(backend: str):
     """Return (RelayDecoderF64, ObservableDecoderRunner, MinSumBPDecoderF64_or_None) for chosen backend."""
-    if backend == "torch":
-        from relay_bp_torch_adapter import RelayDecoderF64Torch as _RelayDecoderF64
-        from relay_bp_torch_adapter import ObservableDecoderRunnerTorch as _ObservableDecoderRunner
-        return _RelayDecoderF64, _ObservableDecoderRunner, None
     if backend == "triton":
         from relay_bp_triton_adapter import RelayDecoderF64 as _RelayDecoderF64
         from relay_bp_triton_adapter import ObservableDecoderRunner as _ObservableDecoderRunner
@@ -87,8 +83,8 @@ def parse_args():
     parser.add_argument('--output-format', type=str, choices=['simple', 'json', 'csv'], default='simple',
                        help='Output format (default: simple)')
     parser.add_argument('--seed', type=int, default=0, help='Global seed for all random number generators (default: 0)')
-    parser.add_argument('--backend', type=str, choices=['rust', 'torch', 'triton'], default=None,
-                       help='Decoder backend to use: rust (default), torch, or triton')
+    parser.add_argument('--backend', type=str, choices=['rust', 'triton'], default=None,
+                       help='Decoder backend to use: rust (default) or triton')
     # Always measure and report execution time unconditionally
     
     return parser.parse_args()
@@ -311,6 +307,7 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     runtime_per_shot = None
     decoder_runtime_per_shot = None
     decoder_runtime_per_iteration = None
+    wall_time_s = None
     decoder_runtime_per_leg = None
     end_time = time.time()
     if start_time and end_time and total_shots > 0:
@@ -543,6 +540,8 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
     decoder_runtime_per_shot = None
     decoder_runtime_per_iteration = None
     end_time = time.time()
+    if start_time and end_time:
+        wall_time_s = (end_time - start_time)
     if start_time and end_time and total_shots > 0:
         runtime_per_shot = (end_time - start_time) * 1e9 / total_shots
     if total_decode_shots > 0:
@@ -558,6 +557,9 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
         'per_cycle_logical_error_rate': float(per_cycle_ler),
         'per_round_per_qubit_rate': float(per_round_per_qubit_rate),
         'avg_bp_iterations': float(avg_bp_iterations),
+        # Aggregated timing totals
+        'decoder_total_time_ns': int(total_decode_ns),
+        'wall_time_s': (float(wall_time_s) if wall_time_s is not None else None),
         'config': {
             'circuit': str(circuit),
             'distance': int(distance),

@@ -34,7 +34,9 @@ class RelayBPPaperStudy:
             'max_iter',
             # Experiment results
             'shots', 'logical_errors', 'logical_error_rate', 'per_cycle_logical_error_rate',
-            'per_round_per_qubit_rate', 'avg_bp_iterations', 'avg_legs', 'runtime_per_shot_ns'
+            'per_round_per_qubit_rate', 'avg_bp_iterations', 'avg_legs',
+            'runtime_per_shot_ns', 'decoder_runtime_per_shot_ns', 'decoder_runtime_per_iteration_ns', 'decoder_runtime_per_leg_ns',
+            'decoder_total_time_ns', 'wall_time_s'
         ]
 
     def _row_from_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
@@ -63,6 +65,11 @@ class RelayBPPaperStudy:
             'avg_bp_iterations': result.get('avg_bp_iterations', ''),
             'avg_legs': result.get('avg_legs', ''),
             'runtime_per_shot_ns': result.get('runtime_per_shot_ns', ''),
+            'decoder_runtime_per_shot_ns': result.get('decoder_runtime_per_shot_ns', ''),
+            'decoder_runtime_per_iteration_ns': result.get('decoder_runtime_per_iteration_ns', ''),
+            'decoder_runtime_per_leg_ns': result.get('decoder_runtime_per_leg_ns', ''),
+            'decoder_total_time_ns': result.get('decoder_total_time_ns', ''),
+            'wall_time_s': result.get('wall_time_s', ''),
         }
 
     def save_result_incremental(self, result: Dict[str, Any]):
@@ -108,7 +115,7 @@ class RelayBPPaperStudy:
 
     def define_plain_bp_grid(self):
         # Sweep plain BP (no memory, no relay) by max_iter and backend to populate x-axis
-        max_iter_values = [1, 5, 10, 20, 40, 60, 80, 100, 200, 300, 500, 600, 700]
+        max_iter_values = [1, 5, 10, 20, 40, 60, 80, 100, 200, 300, 500, 600, 700, 1000, 1500, 2000]
         backends = ['triton']
         configs = []
         for backend in backends:

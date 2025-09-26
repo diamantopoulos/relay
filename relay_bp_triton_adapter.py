@@ -30,7 +30,9 @@ class RelayDecoderF64:
                  beta: Optional[float] = None,
                  dtype_messages: str = "fp32",
                  mode: str = "default",
-                 alpha_iteration_scaling_factor: float = 1.0):
+                 alpha_iteration_scaling_factor: float = 1.0,
+                 bitpack_output: bool = False,
+                 **kwargs):
         # Always coerce to csr_matrix (handles csr_array/coo/coo_array/etc.)
         if sp is not None:
             self.H_csr = sp.csr_matrix(check_matrix)
@@ -62,7 +64,7 @@ class RelayDecoderF64:
             dtype_messages=dtype_messages,
             device=device,
             seed=int(seed or 0),
-            bitpack_output=False,
+            bitpack_output=bitpack_output,
             mode=mode,
             alpha_iteration_scaling_factor=alpha_iteration_scaling_factor,
         )

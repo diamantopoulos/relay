@@ -36,11 +36,11 @@ def bitpack_errors(errors: torch.Tensor, bits_per_word: int = 32) -> torch.Tenso
     # Reshape and pack
     packed = padded_errors.view(B, words_per_batch, bits_per_word)
     
-    # Convert to uint32 words
-    result = torch.zeros(B, words_per_batch, dtype=torch.uint32, device=errors.device)
+    # Convert to int32 words (CUDA supports lshift on int32)
+    result = torch.zeros(B, words_per_batch, dtype=torch.int32, device=errors.device)
     
     for i in range(bits_per_word):
-        result |= (packed[:, :, i].to(torch.uint32) << i)
+        result |= (packed[:, :, i].to(torch.int32) << i)
     
     return result
 
