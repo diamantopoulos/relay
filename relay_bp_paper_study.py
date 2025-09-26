@@ -108,7 +108,7 @@ class RelayBPPaperStudy:
 
     def define_plain_bp_grid(self):
         # Sweep plain BP (no memory, no relay) by max_iter and backend to populate x-axis
-        max_iter_values = [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 200, 300, 500]
+        max_iter_values = [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 200, 300, 500, 600, 700, 800, 900, 1000]
         backends = ['rust', 'triton']
         configs = []
         for backend in backends:
@@ -216,18 +216,18 @@ class RelayBPPaperStudy:
                 self.results.append(result)
                 self.save_result_incremental(result)
         
-        print(f"\nPlain BP Study completed! Collected {len(self.results)} results.")
+        print(f"\nPlain BP study completed! Collected {len(self.results)} results.")
 
-        print("Starting Relay-BP Paper Study...")
+#        print("Starting Relay-BP Paper Study...")
 
-        for i, config in enumerate(configs):
-            print(f"\n[{i+1}/{len(configs)}] {config['name']}")
-            result = self.run_single_config(config, shots)
-            if result is not None:
-                self.results.append(result)
-                self.save_result_incremental(result)
+#        for i, config in enumerate(configs):
+#            print(f"\n[{i+1}/{len(configs)}] {config['name']}")
+#            result = self.run_single_config(config, shots)
+#            if result is not None:
+#                self.results.append(result)
+#                self.save_result_incremental(result)
         
-        print(f"\nStudy completed! Collected {len(self.results)} results.")
+#        print(f"\n Relay BP study completed! Collected {len(self.results)} results.")
 
         # Save results
         self.save_results()
