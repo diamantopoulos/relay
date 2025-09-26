@@ -81,8 +81,9 @@ class RelayBPDecoder:
         if normalized_min_sum_alpha is not None and offset_min_sum_beta is not None:
             raise ValueError("Cannot specify both normalized_min_sum_alpha and offset_min_sum_beta")
         
-        if normalized_min_sum_alpha is not None and not (0 < normalized_min_sum_alpha <= 1):
-            raise ValueError("normalized_min_sum_alpha must be in (0, 1]")
+        # Allow alpha==0.0 to enable the ramp schedule (Rust-like semantics)
+        if normalized_min_sum_alpha is not None and not (0 <= normalized_min_sum_alpha <= 1):
+            raise ValueError("normalized_min_sum_alpha must be in [0, 1]")
         
         if offset_min_sum_beta is not None and offset_min_sum_beta < 0:
             raise ValueError("offset_min_sum_beta must be >= 0")
@@ -183,7 +184,6 @@ class RelayBPDecoder:
             # Beliefs (fp32 for accuracy)
             'lambda_': torch.zeros(B, self.V, dtype=self.acc_dtype, device=self.device),
             'M': torch.zeros(B, self.V, dtype=self.acc_dtype, device=self.device),
-            'M_prev': torch.zeros(B, self.V, dtype=self.acc_dtype, device=self.device),
             'hard_dec': torch.zeros(B, self.V, dtype=torch.uint8, device=self.device),
             
             # Gamma (fp32 for accuracy)
@@ -367,13 +367,13 @@ class RelayBPDecoder:
         v2c_and_marginals_fused_gamma_kernel[grid](
             tensors['nu'], tensors['mu'],
             self.graph.var_ptr, self.graph.var_edges,
-            tensors['lambda_'], tensors['M'], tensors['M_prev'], tensors['hard_dec'],
+            tensors['lambda_'], tensors['M'], tensors['hard_dec'],
             tensors['active'],
             self.lambda0, tensors['gamma'],
             B, self.V, self.E,
             msg_is_fp16,
             self.v2c_config['BLOCK_SIZE'],
-            STORE_M=True,  # Store M so M_prev can be updated for next iter
+            STORE_M=True,
             ROWS_PER_PROG=self.ROWS_PER_PROG_V2C,
             num_warps=self.v2c_config['num_warps'],
             num_stages=self.v2c_config['num_stages']
@@ -426,7 +426,7 @@ class RelayBPDecoder:
             tensors['nuT'], tensors['muT'],
             self.graph.var_ptr, self.graph.var_edges,
             tensors['lambda_'], self.lambda0, tensors['gamma'],
-            tensors['M'], tensors['M_prev'], tensors['hard_dec'],
+            tensors['M'], tensors['hard_dec'],
             tensors['active'],
             B, self.V, self.E,
             msg_is_fp16,
@@ -445,21 +445,23 @@ class RelayBPDecoder:
         # Check if all parity constraints are satisfied
         valid = tensors['check_ok'].view(B, self.C).all(dim=1)  # [B] bool
         idx = torch.nonzero(valid, as_tuple=False).squeeze(1)  # [K]
-        
-        if idx.numel() == 0:
-            return  # No valid solutions, skip weight computation
-        
-        # Only compute weights for valid indices
-        cand_w = (tensors['hard_dec'][idx].float() * self.wj).sum(dim=1)  # [K]
-        
-        better = cand_w < tensors['best_weights'][idx]
-        if better.any():
-            upd = idx[better]
-            tensors['best_weights'][upd] = cand_w[better]
-            tensors['best_errors'][upd] = tensors['hard_dec'][upd]
-            tensors['valid_solutions'][upd] = True
-        
-        tensors['found_count'] += valid.to(torch.int32)
+        # Snapshot previous validity BEFORE mutating valid_solutions
+        prev_valid = tensors['valid_solutions'].clone()
+
+        if idx.numel() > 0:
+            # Only compute weights for valid indices
+            cand_w = (tensors['hard_dec'][idx].float() * self.wj).sum(dim=1)  # [K]
+
+            better = cand_w < tensors['best_weights'][idx]
+            if better.any():
+                upd = idx[better]
+                tensors['best_weights'][upd] = cand_w[better]
+                tensors['best_errors'][upd] = tensors['hard_dec'][upd]
+                tensors['valid_solutions'][upd] = True
+
+        # Count newly found lanes (Rust-like) using the snapshot
+        newly_found = valid & ~prev_valid
+        tensors['found_count'] += newly_found.to(torch.int32)
     
     def decode(self, syndromes: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Decode syndromes using Relay-BP algorithm.
@@ -500,14 +502,16 @@ class RelayBPDecoder:
         
         # Initialize
         tensors['lambda_'][:] = self.lambda0  # Broadcast prior LLRs
-        tensors['M_prev'][:]  = self.lambda0  # Seed previous marginals for t=0 mix
         tensors['best_weights'].fill_(float('inf'))
         tensors['found_count'].zero_()
         tensors['valid_solutions'].zero_()
         
         # Initialize messages
         self._launch_init_kernel(tensors, B)
-        
+        # TODO
+        #tensors['mu'].zero_()
+        #tensors['nu'].zero_()
+
         # Pre-iterations (T0) with uniform gamma0
         gamma0_tensor = sample_gamma_scalar(B, self.V, self.gamma0, self.device)
         tensors['gamma'][:] = gamma0_tensor
@@ -538,8 +542,6 @@ class RelayBPDecoder:
                 self._launch_c2v_kernel(tensors, B)
                 # Fused V2C + gamma mixing updates lambda_ internally
                 self._launch_v2c_fused_gamma_kernel(tensors, B)
-                # M_prev <- M (for next iteration's mixing)
-                tensors['M_prev'].copy_(tensors['M'])
 
             if (t + 1) % self.CHECK_EVERY == 0:
                 # For parity path, we need hard_dec updated (done in v2c btile when write_hard=True)
@@ -563,6 +565,35 @@ class RelayBPDecoder:
         
         # Final parity check after pre-iterations
         self._check_parity_and_select(tensors, B)
+        # Freeze/stop exactly like inside the loop (Rust-like), without bumping iter_counter
+        done_now = tensors['found_count'] >= self.stop_nconv
+        newly_done = done_now & (tensors['first_iter'] < 0)
+        if torch.any(newly_done):
+            tensors['first_iter'][newly_done] = tensors['iter_counter']
+            tensors['frozen_errors'][newly_done] = tensors['best_errors'][newly_done]
+        tensors['active'][done_now] = 0
+        tensors['gamma'][done_now] = 0.0
+        tensors['hard_dec'][done_now] = tensors['frozen_errors'][done_now]
+
+        # If everyone is done, skip legs entirely and return results now
+        if bool(done_now.all()):
+            fallback_errors = torch.where(
+                tensors['valid_solutions'].view(-1, 1),
+                tensors['best_errors'],
+                tensors['hard_dec'],
+            )
+            errors = bitpack_errors(fallback_errors) if self.bitpack_output else fallback_errors
+            iters = torch.where(
+                tensors['first_iter'] >= 0,
+                tensors['first_iter'],
+                tensors['iter_counter'].expand_as(tensors['first_iter'])
+            )
+            return {
+                "errors": errors,
+                "weights": tensors['best_weights'],
+                "valid_mask": tensors['valid_solutions'],
+                "iterations": iters,
+            }
         
         # Relay legs (R times)
         for leg in range(self.num_sets):
@@ -586,7 +617,6 @@ class RelayBPDecoder:
                         self._alpha_current = a
                 self._launch_c2v_kernel(tensors, B)                  # produces ν
                 self._launch_v2c_fused_gamma_kernel(tensors, B)
-                tensors['M_prev'].copy_(tensors['M'])
                 
                 # Check parity and select solutions only every CHECK_EVERY iterations
                 if (t + 1) % self.CHECK_EVERY == 0:
@@ -603,8 +633,19 @@ class RelayBPDecoder:
                     if bool(done_now.all()):
                         break
             
-            # Final parity check and stop flag after each leg
+            # Final parity check after the leg
             self._check_parity_and_select(tensors, B)
+            # Freeze/stop exactly like inside the loop (Rust-like), without bumping iter_counter
+            done_now = tensors['found_count'] >= self.stop_nconv
+            newly_done = done_now & (tensors['first_iter'] < 0)
+            if torch.any(newly_done):
+                tensors['first_iter'][newly_done] = tensors['iter_counter']
+                tensors['frozen_errors'][newly_done] = tensors['best_errors'][newly_done]
+            tensors['active'][done_now] = 0
+            tensors['gamma'][done_now] = 0.0
+            tensors['hard_dec'][done_now] = tensors['frozen_errors'][done_now]
+
+            # Stop-flag path (kept for compatibility)
             self._launch_stop_flag_kernel(tensors, B)
             if tensors['stop_flag'].item():  # One tiny sync occasionally
                 break

@@ -58,6 +58,9 @@ def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Run Relay-BP decoder with detailed iteration counting')
     
+    # Mode parameter
+    parser.add_argument('--mode', choices=['relay','plain'], default='relay')
+
     # Circuit parameters
     parser.add_argument('--circuit', type=str, default='bicycle_bivariate_144_12_12_memory_choi_XZ',
                        help='Circuit name (default: bicycle_bivariate_144_12_12_memory_Z)')
@@ -77,6 +80,7 @@ def parse_args():
     parser.add_argument('--gamma-dist-min', type=float, default=-0.24, help='Gamma distribution minimum (default: -0.24)')
     parser.add_argument('--gamma-dist-max', type=float, default=0.66, help='Gamma distribution maximum (default: 0.66)')
     parser.add_argument('--stop-nconv', type=int, default=1, help='Stop after N converged solutions (default: 1)')
+    parser.add_argument('--alpha', type=float, default=None, help='(plain) Normalized min-sum alpha; None for standard')    
     
     # Execution parameters
     parser.add_argument('--parallel', action='store_true', help='Enable Relay-BP builtin parallelism (default: False)')
@@ -359,9 +363,27 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     return results_data
 
 
+def run_plain_bp_detailed(args):
+    """Run Plain-BP with detailed iteration counting."""
+    return run_plain_bp_experiment(
+        circuit=args.circuit,
+        basis=args.basis,
+        distance=args.distance,
+        rounds=args.rounds,
+        error_rate=args.error_rate,
+        max_iter=args.set_max_iter,
+        alpha=args.alpha,
+        target_errors=args.target_errors,
+        batch=args.batch,
+        max_shots=args.max_shots,
+        parallel=args.parallel,
+        seed=args.seed,
+        backend=args.backend,
+    )
+
 def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
                             max_iter=200, alpha=None, target_errors=20, batch=2000,
-                            max_shots=1000000, parallel=True, seed=0):
+                            max_shots=1000000, parallel=True, seed=0, backend: str | None = None):
     """Run plain min-sum BP (no relay, no memory) with detailed counting."""
 
     try:
@@ -409,22 +431,45 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
     }, sort_keys=True).encode()
     hasher.update(cfg_txt)
 
-    # Build plain min-sum decoder (no relay, no memory)
-    kwargs = dict(
-        error_priors=check_matrices.error_priors,
-        max_iter=max_iter,
-        alpha=None if (alpha == 0.0) else alpha,
-        gamma0=None,
-    )
-    # Always use rust path for plain BP
-    _, _, _MinSumBPDecoderF64 = _select_backend("rust")
-    decoder = _MinSumBPDecoderF64(check_matrices.check_matrix, **kwargs)
-    from relay_bp import ObservableDecoderRunner as _RustObservableRunner
-    observable_decoder = _RustObservableRunner(
-        decoder,
-        check_matrices.observables_matrix,
-        include_decode_result=True,
-    )
+    if backend == "triton":
+        # Plain BP via Triton degeneracy
+        from relay_bp_triton_adapter import RelayDecoderF64 as _RelayDecoderF64
+        from relay_bp_triton_adapter import ObservableDecoderRunner as _ObservableDecoderRunner
+        decoder = _RelayDecoderF64(
+            check_matrices.check_matrix,
+            error_priors=check_matrices.error_priors,
+            gamma0=0.0,
+            pre_iter=max_iter,
+            num_sets=0,
+            set_max_iter=0,
+            gamma_dist_interval=(0.0, 0.0),
+            stop_nconv=1,
+            plain=True,
+            alpha=(None if (alpha is None or alpha == 0.0) else float(alpha)),
+            beta=None,
+            device="cuda",
+        )
+        observable_decoder = _ObservableDecoderRunner(
+            decoder,
+            check_matrices.observables_matrix,
+            include_decode_result=True,
+        )
+    else:
+        # Rust native MinSum BP
+        kwargs = dict(
+            error_priors=check_matrices.error_priors,
+            max_iter=max_iter,
+            alpha=None if (alpha == 0.0) else alpha,
+            gamma0=None,
+        )
+        _, _, _MinSumBPDecoderF64 = _select_backend("rust")
+        decoder = _MinSumBPDecoderF64(check_matrices.check_matrix, **kwargs)
+        from relay_bp import ObservableDecoderRunner as _RustObservableRunner
+        observable_decoder = _RustObservableRunner(
+            decoder,
+            check_matrices.observables_matrix,
+            include_decode_result=True,
+        )
 
     total_shots = 0
     total_errors = 0
@@ -554,17 +599,26 @@ def main():
     print(f"  Rounds: {args.rounds}")
     print(f"  Error Rate: {args.error_rate}")
     print(f"  Basis: {args.basis}")
+    print(f"  Mode: {args.mode}")
+    print(f"  Backend: {args.backend or 'rust'}")
     print()
-    
-    # Relay-BP parameters
-    print("Relay-BP Parameters:")
-    print(f"  Gamma0: {args.gamma0}")
-    print(f"  Pre-iterations: {args.pre_iter}")
-    print(f"  Number of Sets: {args.num_sets}")
-    print(f"  Set Max Iterations: {args.set_max_iter}")
-    print(f"  Gamma Distribution: [{args.gamma_dist_min}, {args.gamma_dist_max}]")
-    print(f"  Stop N Converged: {args.stop_nconv}")
-    print()
+
+    if args.mode == 'relay':
+        # Relay-BP parameters
+        print("Relay-BP Parameters:")
+        print(f"  Gamma0: {args.gamma0}")
+        print(f"  Pre-iterations: {args.pre_iter}")
+        print(f"  Number of Sets: {args.num_sets}")
+        print(f"  Set Max Iterations: {args.set_max_iter}")
+        print(f"  Gamma Distribution: [{args.gamma_dist_min}, {args.gamma_dist_max}]")
+        print(f"  Stop N Converged: {args.stop_nconv}")
+        print()
+    else:
+        # Plain-BP parameters
+        print("Plain-BP Parameters:")
+        print(f"  Max Iterations: {args.set_max_iter}")
+        print(f"  Alpha (normalized min-sum): {args.alpha}")
+        print()
     
     # Execution parameters
     print("Execution Parameters:")
@@ -577,16 +631,21 @@ def main():
     print()
     print("=" * 80)
     print()
-    
-    # Run Relay-BP with detailed counting
-    results = run_relay_bp_detailed(args)
+
+    if args.mode == 'plain':
+        results = run_plain_bp_detailed(args)
+    elif args.mode == 'relay':
+        results = run_relay_bp_detailed(args)
+    else:
+        raise ValueError(f"Invalid mode: {args.mode}")
     
     # Output results based on format
     if args.output_format == 'simple':
         print(f"Shots: {results['shots']}, Logical Errors: {results['logical_errors']}")
         print(f"Logical Error Rate: {results['logical_error_rate']:.2e}")
         print(f"Per-Cycle Logical Error Rate: {results['per_cycle_logical_error_rate']:.2e}")
-        print(f"Average BP Iterations: {results['avg_bp_iterations']:.1f} (legs: {results['avg_legs']:.1f})")
+        legs_suffix = f" (legs: {results['avg_legs']:.1f})" if 'avg_legs' in results else ""
+        print(f"Average BP Iterations: {results['avg_bp_iterations']:.1f}{legs_suffix}")
         if 'runtime_per_shot_ns' in results:
             print(f"Runtime per shot: {_format_time_units(results['runtime_per_shot_ns'])}")
         # Decoder-only timing metrics if available

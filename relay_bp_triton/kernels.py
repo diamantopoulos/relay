@@ -110,6 +110,8 @@ def c2v_min_sum_kernel(
                     is_argmin = (e == argmin_e)
                     use_min2  = (cnt1 == 1) & is_argmin
                     out_mag   = tl.where(use_min2, min2, min1)
+                    # Degree-1 checks must send zero.
+                    out_mag   = tl.where(deg == 1, 0.0, out_mag)
 
                     if use_alpha:
                         out_mag = alpha * out_mag
@@ -138,7 +140,7 @@ def v2c_and_marginals_kernel(
 def v2c_and_marginals_fused_gamma_kernel(
     nu, mu,                 # [B,E]
     var_ptr, var_edges,     # CSR over vars -> edge IDs
-    lam, M, M_prev, hard_dec,  # [B,V], [B,V], [B,V], [B,V]
+    lam, M, hard_dec,  # [B,V], [B,V], [B,V]
     active,                    # [B] uint8 mask (1=active)
     lam0, gamma,            # [1,V], [B,V] - for gamma mixing
     B, V, E,
@@ -186,8 +188,7 @@ def v2c_and_marginals_fused_gamma_kernel(
             # FUSED GAMMA MIXING with PREVIOUS marginals: lam = (1-γ)*λ0 + γ*M_prev
             g_bj = tl.load(gamma + b*V + j)           # [B,V]
             lam0_j = tl.load(lam0 + j)                # [1,V]
-            M_bj_prev = tl.load(M_prev + b*V + j)
-            lam_bj_new = (1.0 - g_bj) * lam0_j + g_bj * M_bj_prev
+            lam_bj_new = (1.0 - g_bj) * lam0_j + g_bj * M_bj_curr
             tl.store(lam + b*V + j, lam_bj_new)
 
             # PASS 2: write mu = lam + (sum_nu - nu_e) using NEW lam (vectorized)
@@ -591,6 +592,8 @@ def c2v_min_sum_btile_kernel(
         is_min1 = (a_mask == min1[None, :])
         use_min2 = (cnt1[None, :] == 1) & is_min1
         out_mag = tl.where(use_min2, min2[None, :], min1[None, :])
+        # Degree-1 checks must send zero.
+        out_mag = tl.where((row_end - row_start) == 1, 0.0, out_mag)
         if use_alpha:
             out_mag = alpha * out_mag
         if use_beta:
@@ -608,7 +611,7 @@ def v2c_and_gamma_btile_kernel(
     nuT, muT,                 # [E,B]
     var_ptr, var_edges,       # CSR over vars -> edge IDs
     lam, lam0, gamma,         # [B,V], [V], [B,V]
-    M, M_prev, hard_dec,      # [B,V], [B,V], [B,V]
+    M, hard_dec,              # [B,V], [B,V]
     active,                   # [B] uint8 mask
     B, V, E,
     msg_is_fp16: tl.constexpr,
@@ -652,8 +655,7 @@ def v2c_and_gamma_btile_kernel(
         tl.store(hard_dec + bs * V + j, (M_bj < 0.0).to(tl.uint8), mask=mb_act)
     g_bj = tl.load(gamma + bs * V + j, mask=mb_act, other=0.0)
     lam0_j = tl.load(lam0 + j)
-    M_prev_bj = tl.load(M_prev + bs * V + j, mask=mb_act, other=0.0)
-    lam_new = (1.0 - g_bj) * lam0_j + g_bj * M_prev_bj
+    lam_new = (1.0 - g_bj) * lam0_j + g_bj * M_bj
     tl.store(lam + bs * V + j, lam_new, mask=mb_act)
 
     # write muT for each edge lane (vectorized)

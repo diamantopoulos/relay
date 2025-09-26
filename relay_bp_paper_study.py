@@ -28,17 +28,20 @@ class RelayBPPaperStudy:
     def _csv_fieldnames(self) -> list[str]:
         return [
             # Configuration parameters
-            'config_name', 'num_sets', 'stop_nconv', 'gamma0', 'gamma_dist_min', 'gamma_dist_max',
+            'config_name', 'mode', 'backend',
+            'num_sets', 'stop_nconv', 'gamma0', 'gamma_dist_min', 'gamma_dist_max',
             'pre_iter', 'set_max_iter', 'circuit', 'distance', 'rounds', 'error_rate', 'basis',
             'max_iter',
             # Experiment results
             'shots', 'logical_errors', 'logical_error_rate', 'per_cycle_logical_error_rate',
-            'per_round_per_qubit_rate', 'avg_bp_iterations', 'runtime_per_shot_ns'
+            'per_round_per_qubit_rate', 'avg_bp_iterations', 'avg_legs', 'runtime_per_shot_ns'
         ]
 
     def _row_from_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
         return {
             'config_name': result.get('config_name', ''),
+            'mode': result.get('mode', ''),
+            'backend': result.get('backend', ''),
             'num_sets': result.get('num_sets', ''),
             'stop_nconv': result.get('stop_nconv', ''),
             'gamma0': result.get('gamma0', ''),
@@ -58,6 +61,7 @@ class RelayBPPaperStudy:
             'per_cycle_logical_error_rate': result.get('per_cycle_logical_error_rate', ''),
             'per_round_per_qubit_rate': result.get('per_round_per_qubit_rate', ''),
             'avg_bp_iterations': result.get('avg_bp_iterations', ''),
+            'avg_legs': result.get('avg_legs', ''),
             'runtime_per_shot_ns': result.get('runtime_per_shot_ns', ''),
         }
 
@@ -80,34 +84,42 @@ class RelayBPPaperStudy:
 
     
     def define_parameter_grid(self):
+        backends = ['rust', 'triton']
         # Fix S (stop_nconv) and sweep R (num_sets) broadly per the paper
         stop_nconv_values = [1, 2, 3, 5, 7, 9]
         # Use an odd sweep for R to populate x-axis (adjust upper bound as needed)
         num_sets_values = [1, 3, 5, 9, 13, 21, 45]
         configs = []
-        for s in stop_nconv_values:
-            for r in num_sets_values:
-                configs.append({
-                    'name': f'Relay-BP-S{s}-R{r}',
-                    'num_sets': r,
-                    'gamma0': 0.125,
-                    'gamma_dist_interval': (-0.24, 0.66),
-                    'pre_iter': 80,
-                    'set_max_iter': 60,
-                    'stop_nconv': s,
-                })
+        for backend in backends:
+            for s in stop_nconv_values:
+                for r in num_sets_values:
+                    configs.append({
+                        'name': f'Relay-BP-S{s}-R{r}-{backend}',
+                        'mode': 'relay',
+                        'backend': backend,
+                        'num_sets': r,
+                        'gamma0': 0.125,
+                        'gamma_dist_interval': (-0.24, 0.66),
+                        'pre_iter': 80,
+                        'set_max_iter': 60,
+                        'stop_nconv': s,
+                    })
         return configs
 
     def define_plain_bp_grid(self):
-        # Sweep plain BP (no memory, no relay) by max_iter to populate x-axis
+        # Sweep plain BP (no memory, no relay) by max_iter and backend to populate x-axis
         max_iter_values = [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 200, 300, 500]
+        backends = ['rust', 'triton']
         configs = []
-        for tmax in max_iter_values:
-            configs.append({
-                'name': f'PlainBP-maxiter{tmax}',
-                'max_iter': tmax,
-                'alpha': None,
-            })
+        for backend in backends:
+            for tmax in max_iter_values:
+                configs.append({
+                    'name': f'PlainBP-maxiter{tmax}-{backend}',
+                    'mode': 'plain',
+                    'backend': backend,
+                    'max_iter': tmax,
+                    'alpha': None,
+                })
         return configs
 
     def run_single_config(self, config: Dict[str, Any], shots: int = 1000) -> Dict[str, Any]:
@@ -133,11 +145,14 @@ class RelayBPPaperStudy:
                 target_errors=100,
                 batch=20000,
                 max_shots=1000000,
-                parallel=True
+                parallel=True,
+                backend=config.get('backend', None),
             )
             
             # Add configuration info
             output_data['config_name'] = config['name']
+            output_data['mode'] = 'relay'
+            output_data['backend'] = config.get('backend', '')
             output_data['num_sets'] = config['num_sets']
             output_data['stop_nconv'] = config['stop_nconv']
             output_data['gamma0'] = config['gamma0']
@@ -147,7 +162,8 @@ class RelayBPPaperStudy:
             
             
             print(f"  LER: {output_data['logical_error_rate']:.2e}, Per-cycle LER: {output_data['per_cycle_logical_error_rate']:.2e}")
-            print(f"  Avg BP iterations: {output_data['avg_bp_iterations']:.1f} (legs: {output_data['avg_legs']:.1f})")
+            legs_suffix = f" (legs: {output_data['avg_legs']:.1f})" if 'avg_legs' in output_data else ""
+            print(f"  Avg BP iterations: {output_data['avg_bp_iterations']:.1f}{legs_suffix}")
             
             return output_data
             
@@ -169,9 +185,12 @@ class RelayBPPaperStudy:
                 target_errors=200,
                 batch=10_000,
                 max_shots=2_000_000,
-                parallel=True
+                parallel=True,
+                backend=config.get('backend', 'rust'),
             )
             output_data['config_name'] = config['name']
+            output_data['mode'] = 'plain'
+            output_data['backend'] = config.get('backend', '')
             output_data['max_iter'] = config['max_iter']
             print(f"  LER: {output_data['logical_error_rate']:.2e}, Per-cycle LER: {output_data['per_cycle_logical_error_rate']:.2e}")
             print(f"  Avg BP iterations: {output_data['avg_bp_iterations']:.1f}")
