@@ -15,6 +15,7 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from typing import Dict, Optional, Tuple, Union
 import os
+from dataclasses import dataclass
 
 from .graph import CSRGraph
 from .kernels import (
@@ -28,6 +29,29 @@ from .utils import (
     sample_gamma_scalar, validate_error_priors, validate_csr_matrix,
     bitpack_errors, bitunpack_errors
 )
+@dataclass
+class PerfCfg:
+    mode: str
+    msg_dtype: str
+    check_every: int
+    btile: int
+    rows_per_chk: int
+    rows_per_var: int
+    c2v_block: int
+    c2v_warps: int
+    c2v_stages: int
+    v2c_block: int
+    v2c_warps: int
+    v2c_stages: int
+
+@dataclass
+class RtCfg:
+    Q: int
+    check_every: int
+    msg_dtype: str
+    num_warps: int
+    block_size: int
+
 
 
 class RelayBPDecoder:
@@ -148,27 +172,37 @@ class RelayBPDecoder:
         self.v2c_config = self.autotuner.tune_v2c_kernel(
             self.graph.max_deg_var, self.msg_dtype, device
         )
+
+        # Centralize perf config
+        self.cfg = PerfCfg(
+            mode=self.mode,
+            msg_dtype=self.dtype_messages,
+            check_every=int(os.getenv("RELAY_CHECK_EVERY", "1")),
+            btile=int(os.getenv("RELAY_BTILE", "16")),
+            rows_per_chk=int(os.getenv("RELAY_ROWS_PER_CHK", "8")),
+            rows_per_var=int(os.getenv("RELAY_ROWS_PER_VAR", "8")),
+            c2v_block=self.c2v_config['BLOCK_SIZE'],
+            c2v_warps=self.c2v_config['num_warps'],
+            c2v_stages=self.c2v_config['num_stages'],
+            v2c_block=self.v2c_config['BLOCK_SIZE'],
+            v2c_warps=self.v2c_config['num_warps'],
+            v2c_stages=self.v2c_config['num_stages'],
+        )
         
         # Set up RNG
         torch.manual_seed(seed)
         
         # Pre-allocate device tensors (will be allocated in decode)
         self._device_tensors = {}
-        
-        # Constants for device-driven early exit
-        self.CHECK_EVERY = 1  # Check stop flag every N iterations
-        
-        # Constants for kernel batching (reduce launch overhead)
-        self.ROWS_PER_PROG_C2V = 8  # Number of rows per C2V program
-        self.ROWS_PER_PROG_V2C = 8  # Number of rows per V2C program
-        self.ROWS_PER_PROG_PAR = 8  # Number of rows per parity program
 
-        # Realtime env toggles
-        self.rt_Q = int(os.getenv("RELAY_RT_QUEUE", "64"))
-        self.rt_check_every = int(os.getenv("RELAY_RT_CHECK_EVERY", "8"))
-        self.rt_msg_dtype = os.getenv("RELAY_RT_MSG_DTYPE", "fp16")
-        self.rt_num_warps = int(os.getenv("RELAY_RT_PERSIST_WARPS", "8"))
-        self.rt_block_size = int(os.getenv("RELAY_RT_BLOCK_SIZE", "128"))
+        # Realtime config (single env read)
+        self.rt_cfg = RtCfg(
+            Q=int(os.getenv("RELAY_RT_QUEUE", "64")),
+            check_every=int(os.getenv("RELAY_RT_CHECK_EVERY", "8")),
+            msg_dtype=os.getenv("RELAY_RT_MSG_DTYPE", "fp16"),
+            num_warps=int(os.getenv("RELAY_RT_PERSIST_WARPS", "8")),
+            block_size=int(os.getenv("RELAY_RT_BLOCK_SIZE", "128")),
+        )
         self._rt_worker_launched = False
     
     def _allocate_device_tensors(self, B: int):
@@ -212,7 +246,7 @@ class RelayBPDecoder:
     def _allocate_realtime_state(self):
         if hasattr(self, "_rt_state_allocated") and self._rt_state_allocated:
             return
-        Q = self.rt_Q
+        Q = self.rt_cfg.Q
         # queues
         self.rt_syndromes = torch.zeros(Q, self.C, dtype=torch.uint8, device=self.device)
         self.rt_errors = torch.zeros(Q, self.V, dtype=torch.uint8, device=self.device)
@@ -220,7 +254,7 @@ class RelayBPDecoder:
         self.rt_valid = torch.zeros(Q, dtype=torch.uint8, device=self.device)
         self.rt_slot_state = torch.zeros(Q, dtype=torch.int32, device=self.device)  # 0=EMPTY,1=READY,2=DONE
         # state B=1
-        msg_dtype = torch.float16 if self.rt_msg_dtype == "fp16" else torch.float32
+        msg_dtype = torch.float16 if self.rt_cfg.msg_dtype == "fp16" else torch.float32
         self.rt_mu = torch.zeros(self.E, dtype=msg_dtype, device=self.device)
         self.rt_nu = torch.zeros(self.E, dtype=msg_dtype, device=self.device)
         self.rt_lambda = torch.zeros(self.V, dtype=torch.float32, device=self.device)
@@ -243,17 +277,17 @@ class RelayBPDecoder:
             self.rt_mu, self.rt_nu, self.rt_lambda, self.rt_M, self.rt_gamma, self.rt_hard_dec, self.rt_check_ok,
             self.lambda0,
             self.rt_syndromes, self.rt_errors, self.rt_weights, self.rt_valid, self.rt_slot_state,
-            self.rt_Q, self.C, self.V, self.E,
+            self.rt_cfg.Q, self.C, self.V, self.E,
             self.normalized_min_sum_alpha or 0.0, self.offset_min_sum_beta or 0.0,
-            self.pre_iter, self.set_max_iter, self.num_sets, self.rt_check_every,
+            self.pre_iter, self.set_max_iter, self.num_sets, self.rt_cfg.check_every,
             use_alpha=(self.normalized_min_sum_alpha is not None),
             use_beta=(self.offset_min_sum_beta is not None),
             msg_is_fp16=msg_is_fp16,
-            BLOCK_SIZE=self.rt_block_size,
-            ROWS_PER_CHK=8,
-            ROWS_PER_VAR=8,
+            BLOCK_SIZE=self.rt_cfg.block_size,
+            ROWS_PER_CHK=self.cfg.rows_per_chk,
+            ROWS_PER_VAR=self.cfg.rows_per_var,
             MAX_STEPS=1000000,
-            num_warps=self.rt_num_warps,
+            num_warps=self.rt_cfg.num_warps,
             num_stages=2,
             )
         self._rt_worker_launched = True
@@ -269,7 +303,7 @@ class RelayBPDecoder:
             syndrome = syndrome.view(1, -1)
         assert syndrome.shape == (1, self.C)
         self._ensure_worker()
-        Q = self.rt_Q
+        Q = self.rt_cfg.Q
         slot = self._rt_head % Q
         # ensure slot empty
         # write syndrome
@@ -298,7 +332,7 @@ class RelayBPDecoder:
         msg_is_fp16 = (self.msg_dtype == torch.float16)
         be_to_eb_kernel[grid](
             src_be, dst_eb, B, self.E,
-            msg_is_fp16, BTILE=16,
+            msg_is_fp16, BTILE=self.cfg.btile,
         )
 
     def _eb_to_be(self, src_eb: torch.Tensor, dst_be: torch.Tensor, B: int):
@@ -306,11 +340,11 @@ class RelayBPDecoder:
         msg_is_fp16 = (self.msg_dtype == torch.float16)
         eb_to_be_kernel[grid](
             src_eb, dst_be, B, self.E,
-            msg_is_fp16, BTILE=16,
+            msg_is_fp16, BTILE=self.cfg.btile,
         )
 
     def _launch_c2v_btile(self, tensors: Dict, B: int):
-        grid = (self.C, (B + 16 - 1) // 16)
+        grid = (self.C, (B + self.cfg.btile - 1) // self.cfg.btile)
         alpha = self.normalized_min_sum_alpha or 0.0
         beta = self.offset_min_sum_beta or 0.0
         use_alpha = self.normalized_min_sum_alpha is not None
@@ -322,10 +356,10 @@ class RelayBPDecoder:
             tensors['syndrome'], tensors['active'], B, self.C, self.E,
             alpha, beta, use_alpha, use_beta,
             msg_is_fp16,
-            self.c2v_config['BLOCK_SIZE'],
-            BTILE=16,
-            num_warps=self.c2v_config['num_warps'],
-            num_stages=self.c2v_config['num_stages'],
+            self.cfg.c2v_block,
+            BTILE=self.cfg.btile,
+            num_warps=self.cfg.c2v_warps,
+            num_stages=self.cfg.c2v_stages,
         )
     
     def _launch_c2v_kernel(self, tensors: Dict, B: int):
@@ -337,7 +371,7 @@ class RelayBPDecoder:
         use_beta = self.offset_min_sum_beta is not None
         
         total = B * self.C
-        grid = ((total + self.ROWS_PER_PROG_C2V - 1) // self.ROWS_PER_PROG_C2V,)
+        grid = ((total + self.cfg.rows_per_chk - 1) // self.cfg.rows_per_chk,)
         
         msg_is_fp16 = (self.msg_dtype == torch.float16)
         
@@ -348,10 +382,10 @@ class RelayBPDecoder:
             B, self.C, self.E,
             alpha, beta, use_alpha, use_beta,
             msg_is_fp16,
-            self.c2v_config['BLOCK_SIZE'],
-            ROWS_PER_PROG=self.ROWS_PER_PROG_C2V,
-            num_warps=self.c2v_config['num_warps'],
-            num_stages=self.c2v_config['num_stages']
+            self.cfg.c2v_block,
+            ROWS_PER_PROG=self.cfg.rows_per_chk,
+            num_warps=self.cfg.c2v_warps,
+            num_stages=self.cfg.c2v_stages
         )
     
     def _launch_v2c_kernel(self, tensors: Dict, B: int):
@@ -361,7 +395,7 @@ class RelayBPDecoder:
     def _launch_v2c_fused_gamma_kernel(self, tensors: Dict, B: int):
         """Launch variable-to-check and marginals kernel with fused gamma mixing."""
         total = B * self.V
-        grid = ((total + self.ROWS_PER_PROG_V2C - 1) // self.ROWS_PER_PROG_V2C,)
+        grid = ((total + self.cfg.rows_per_var - 1) // self.cfg.rows_per_var,)
         msg_is_fp16 = (self.msg_dtype == torch.float16)
         
         v2c_and_marginals_fused_gamma_kernel[grid](
@@ -372,11 +406,11 @@ class RelayBPDecoder:
             self.lambda0, tensors['gamma'],
             B, self.V, self.E,
             msg_is_fp16,
-            self.v2c_config['BLOCK_SIZE'],
+            self.cfg.v2c_block,
             STORE_M=True,
-            ROWS_PER_PROG=self.ROWS_PER_PROG_V2C,
-            num_warps=self.v2c_config['num_warps'],
-            num_stages=self.v2c_config['num_stages']
+            ROWS_PER_PROG=self.cfg.rows_per_var,
+            num_warps=self.cfg.v2c_warps,
+            num_stages=self.cfg.v2c_stages
         )
     
     def _launch_gamma_mix_kernel(self, tensors: Dict, B: int):
@@ -386,17 +420,17 @@ class RelayBPDecoder:
     def _launch_parity_check_kernel(self, tensors: Dict, B: int):
         """Launch parity check kernel."""
         total = B * self.C
-        grid = ((total + self.ROWS_PER_PROG_PAR - 1) // self.ROWS_PER_PROG_PAR,)
+        grid = ((total + self.cfg.rows_per_chk - 1) // self.cfg.rows_per_chk,)
         
         parity_per_check_kernel[grid](
             tensors['hard_dec'],
             self.graph.chk_ptr, self.graph.chk_edges, self.graph.edge_var,
             tensors['syndrome'], tensors['check_ok'],
             B, self.C, self.V, self.E,
-            self.c2v_config['BLOCK_SIZE'],
-            ROWS_PER_PROG=self.ROWS_PER_PROG_PAR,
-            num_warps=self.c2v_config['num_warps'],
-            num_stages=self.c2v_config['num_stages'],
+            self.cfg.c2v_block,
+            ROWS_PER_PROG=self.cfg.rows_per_chk,
+            num_warps=self.cfg.c2v_warps,
+            num_stages=self.cfg.c2v_stages,
         )
     
     def _launch_init_kernel(self, tensors: Dict, B: int):
@@ -420,7 +454,7 @@ class RelayBPDecoder:
         )
     
     def _launch_v2c_btile(self, tensors: Dict, B: int, write_hard: bool):
-        grid = (self.V, (B + 16 - 1) // 16)
+        grid = (self.V, (B + self.cfg.btile - 1) // self.cfg.btile)
         msg_is_fp16 = (self.msg_dtype == torch.float16)
         v2c_and_gamma_btile_kernel[grid](
             tensors['nuT'], tensors['muT'],
@@ -430,11 +464,11 @@ class RelayBPDecoder:
             tensors['active'],
             B, self.V, self.E,
             msg_is_fp16,
-            self.v2c_config['BLOCK_SIZE'],
-            BTILE=16,
+            self.cfg.v2c_block,
+            BTILE=self.cfg.btile,
             WRITE_HARD=write_hard,
-            num_warps=self.v2c_config['num_warps'],
-            num_stages=self.v2c_config['num_stages'],
+            num_warps=self.cfg.v2c_warps,
+            num_stages=self.cfg.v2c_stages,
         )
     
     def _check_parity_and_select(self, tensors: Dict, B: int):
@@ -520,7 +554,7 @@ class RelayBPDecoder:
         gamma0_tensor = sample_gamma_scalar(B, self.V, self.gamma0, self.device)
         tensors['gamma'][:] = gamma0_tensor
         
-        if self.mode == "throughput":
+        if self.cfg.mode == "throughput":
             # transpose mu/nu to [E,B] once
             self._be_to_eb(tensors['mu'], tensors['muT'], B)
             self._be_to_eb(tensors['nu'], tensors['nuT'], B)
@@ -538,16 +572,16 @@ class RelayBPDecoder:
                     self._alpha_current = 1.0
                 else:
                     self._alpha_current = a
-            if self.mode == "throughput":
+            if self.cfg.mode == "throughput":
                 # BTILE C2V and V2C fully in [E,B]
                 self._launch_c2v_btile(tensors, B)
-                self._launch_v2c_btile(tensors, B, write_hard=((t+1) % self.CHECK_EVERY == 0))
+                self._launch_v2c_btile(tensors, B, write_hard=((t+1) % self.cfg.check_every == 0))
             else:
                 self._launch_c2v_kernel(tensors, B)
                 # Fused V2C + gamma mixing updates lambda_ internally
                 self._launch_v2c_fused_gamma_kernel(tensors, B)
 
-            if (t + 1) % self.CHECK_EVERY == 0:
+            if (t + 1) % self.cfg.check_every == 0:
                 # For parity path, we need hard_dec updated (done in v2c btile when write_hard=True)
                 self._check_parity_and_select(tensors, B)
                 # Host-side per-lane freezing and exit
@@ -623,7 +657,7 @@ class RelayBPDecoder:
                 self._launch_v2c_fused_gamma_kernel(tensors, B)
                 
                 # Check parity and select solutions only every CHECK_EVERY iterations
-                if (t + 1) % self.CHECK_EVERY == 0:
+                if (t + 1) % self.cfg.check_every == 0:
                     self._check_parity_and_select(tensors, B)
                     done_now = tensors['found_count'] >= self.stop_nconv
                     newly_done = done_now & (tensors['first_iter'] < 0)
