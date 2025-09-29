@@ -319,7 +319,7 @@ class RelayBPDecoder:
         c2v_min_sum_btile_kernel[grid](
             tensors['muT'], tensors['nuT'],
             self.graph.chk_ptr, self.graph.chk_edges,
-            tensors['syndrome'], B, self.C, self.E,
+            tensors['syndrome'], tensors['active'], B, self.C, self.E,
             alpha, beta, use_alpha, use_beta,
             msg_is_fp16,
             self.c2v_config['BLOCK_SIZE'],
