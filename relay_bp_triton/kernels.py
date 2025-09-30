@@ -276,7 +276,7 @@ PARITY_CONFIGS = [
 
 @triton.jit
 def parity_per_check_kernel(
-    hard_dec,                # [B,V] uint8
+    M,                       # [B,V] fp32 (read-only)
     chk_ptr, chk_edges,      # CSR over checks -> edge IDs
     edge_var,                # [E] var index per edge
     syndrome,                # [B,C] uint8
@@ -285,7 +285,7 @@ def parity_per_check_kernel(
     BLOCK_SIZE: tl.constexpr,
     ROWS_PER_CHK: tl.constexpr,  # Number of check rows to process per program
 ):
-    """Parity check kernel with proper tiling over all neighbors (batched)."""
+    """Parity check kernel reading beliefs M and deriving bits via (M < 0)."""
     pid = tl.program_id(axis=0)
     base = pid * ROWS_PER_CHK
     
@@ -307,7 +307,8 @@ def parity_per_check_kernel(
                 m    = offs < row_end
                 e    = tl.load(chk_edges + offs, mask=m, other=0)
                 v    = tl.load(edge_var + e,     mask=m, other=0)
-                bits = tl.load(hard_dec + b*V + v, mask=m, other=0).to(tl.int32) & 1
+                Mv   = tl.load(M + b*V + v, mask=m, other=0.0)
+                bits = (Mv < 0.0).to(tl.int32) & 1
                 par  = par ^ (tl.sum(tl.where(m, bits, 0), axis=0) & 1)
                 tile += BLOCK_SIZE
 
@@ -591,8 +592,9 @@ def v2c_and_gamma_btile_kernel(
     lam_bj = tl.load(lam + bs * V + j, mask=mb_act, other=0.0)
     M_bj = lam_bj + sum_nu
     tl.store(M + bs * V + j, M_bj, mask=mb_act)
-    # Always update hard_dec (matches regular V2C kernel behavior)
-    tl.store(hard_dec + bs * V + j, (M_bj < 0.0).to(tl.uint8), mask=mb_act)
+    # Optionally update hard_dec if requested (to avoid bandwidth in hot path)
+    if WRITE_HARD:
+        tl.store(hard_dec + bs * V + j, (M_bj < 0.0).to(tl.uint8), mask=mb_act)
     g_bj = tl.load(gamma + bs * V + j, mask=mb_act, other=0.0)
     lam0_j = tl.load(lam0 + j)
     lam_new = (1.0 - g_bj) * lam0_j + g_bj * M_bj

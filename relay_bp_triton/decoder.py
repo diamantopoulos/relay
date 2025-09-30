@@ -239,7 +239,6 @@ class RelayBPDecoder:
             'found_count': torch.zeros(B, dtype=torch.int32, device=self.device),
             'valid_solutions': torch.zeros(B, dtype=torch.bool, device=self.device),
             
-            # Device-driven early exit (replaced with all_done_flag later per decode)
         }
         if self.cfg.perf == "throughput":
             # [E,B] transposed message buffers for BTILE kernels
@@ -587,7 +586,7 @@ class RelayBPDecoder:
                 kernel=parity_per_check_kernel,
                 grid=grid,
                 args=(
-                    tensors['hard_dec'],
+                    tensors['M'],
                     self.graph.chk_ptr, self.graph.chk_edges, self.graph.edge_var,
                     tensors['syndrome'], tensors['check_ok'],
                 ),
@@ -601,7 +600,7 @@ class RelayBPDecoder:
             print(f"[relay-bp-triton] Using cached meta for parity_per_check_kernel from {ac.DEFAULT_CACHE} key={problem_key}")
             self._tune_logged.add("parity_per_check_kernel")
         parity_per_check_kernel[grid](
-            tensors['hard_dec'],
+            tensors['M'],
             self.graph.chk_ptr, self.graph.chk_edges, self.graph.edge_var,
             tensors['syndrome'], tensors['check_ok'],
             **meta_base,
@@ -680,14 +679,15 @@ class RelayBPDecoder:
         prev_valid = tensors['valid_solutions'].clone()
 
         if idx.numel() > 0:
-            # Only compute weights for valid indices
-            cand_w = (tensors['hard_dec'][idx].float() * self.wj).sum(dim=1)  # [K]
+            # Only compute weights for valid indices; derive current hard decisions from M
+            curr_hd = (tensors['M'][idx] < 0).to(torch.uint8)
+            cand_w = (curr_hd.float() * self.wj).sum(dim=1)  # [K]
 
             better = cand_w < tensors['best_weights'][idx]
             if better.any():
                 upd = idx[better]
                 tensors['best_weights'][upd] = cand_w[better]
-                tensors['best_errors'][upd] = tensors['hard_dec'][upd]
+                tensors['best_errors'][upd] = curr_hd[better]
                 tensors['valid_solutions'][upd] = True
 
         # Count newly found lanes (Rust-like) using the snapshot
@@ -798,9 +798,7 @@ class RelayBPDecoder:
                     break
         
         # Final parity check after pre-iterations
-        if self.cfg.perf == "throughput":
-            # Ensure hard_dec is fresh before parity
-            self._launch_v2c_btile(tensors, B, write_hard=True)
+        # In throughput mode we no longer force hard_dec writes; parity reads from M
         self._check_parity_and_select(tensors, B)
         # Device-side freeze without bumping iter_counter
         freeze_finished_lanes_kernel[(B,)](

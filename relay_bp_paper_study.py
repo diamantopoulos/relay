@@ -101,7 +101,7 @@ class RelayBPPaperStudy:
         max_iter_values = [1, 5, 10, 20, 40, 60, 80, 100, 200, 300, 500, 600, 700, 1000, 1500, 2000, 5000, 10000]
         for backend in backends:
             # Supported dtype per backend
-            dtypes = ['fp16','fp32'] if backend == 'triton' else ['fp32','fp64']
+            dtypes = ['fp32'] #['fp16','fp32'] if backend == 'triton' else ['fp32','fp64']
             for dtype in dtypes:
                 for tmax in max_iter_values:
                     configs.append({
