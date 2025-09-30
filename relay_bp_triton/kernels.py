@@ -373,6 +373,68 @@ def stop_flag_kernel(
 
 
 @triton.jit
+def reduce_all_ge_kernel(
+    found_count,      # [B] int32
+    stop_nconv,       # scalar int32
+    out_flag,         # [1] uint8 (out)
+    B                 # scalar int32
+):
+    """Tiny reduction: out_flag[0] = 1 iff for all b, found_count[b] >= stop_nconv."""
+    pid = tl.program_id(axis=0)
+    if pid != 0:
+        return
+    acc = tl.full((), 1, dtype=tl.int32)
+    tile = 0
+    while tile < B:
+        offs = tile + tl.arange(0, 256)
+        m    = offs < B
+        fc   = tl.load(found_count + offs, mask=m, other=stop_nconv)
+        ok   = (fc >= stop_nconv).to(tl.int32)
+        acc  = tl.minimum(acc, tl.min(tl.where(m, ok, 1), axis=0))
+        tile += 256
+    tl.store(out_flag, acc.to(tl.uint8))
+
+
+@triton.jit
+def freeze_finished_lanes_kernel(
+    valid_solutions, best_errors,           # [B] bool, [B,V] uint8
+    hard_dec, gamma, active,                # [B,V] uint8, [B,V] fp32, [B] uint8
+    found_count, first_iter, iter_counter,  # [B] int32, [B] int32, scalar int32
+    stop_nconv, V: tl.constexpr
+):
+    """Freeze lanes that reached the target and capture first_iter on device.
+
+    For lanes with (found_count >= stop_nconv) and first_iter < 0:
+      - first_iter[b] = iter_counter
+      - hard_dec[b, :] = best_errors[b, :]
+    For all lanes with (found_count >= stop_nconv):
+      - active[b] = 0
+      - gamma[b, :] = 0
+    """
+    b = tl.program_id(axis=0)
+    fc = tl.load(found_count + b)
+    done_now = (fc >= stop_nconv)
+    if done_now:
+        fi = tl.load(first_iter + b)
+        if fi < 0:
+            itc = tl.load(iter_counter)
+            tl.store(first_iter + b, itc)
+            col = 0
+            while col < V:
+                offs = col + tl.arange(0, 128)
+                m = offs < V
+                be = tl.load(best_errors + b * V + offs, mask=m, other=0)
+                tl.store(hard_dec + b * V + offs, be, mask=m)
+                col += 128
+        tl.store(active + b, 0)
+        col2 = 0
+        while col2 < V:
+            offs2 = col2 + tl.arange(0, 128)
+            m2 = offs2 < V
+            tl.store(gamma + b * V + offs2, 0.0, mask=m2)
+            col2 += 128
+
+@triton.jit
 def be_to_eb_kernel(
     src_be, dst_eb,
     B, E,

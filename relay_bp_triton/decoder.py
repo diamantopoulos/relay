@@ -25,6 +25,7 @@ from .kernels import (
     parity_per_check_kernel, init_messages_kernel, stop_flag_kernel,
     be_to_eb_kernel, eb_to_be_kernel, c2v_min_sum_btile_kernel, v2c_and_gamma_btile_kernel,
     relay_decode_persistent_kernel,
+    reduce_all_ge_kernel, freeze_finished_lanes_kernel,
 )
 from .utils import (
     compute_log_prior_ratios, sample_gamma_uniform,
@@ -742,6 +743,10 @@ class RelayBPDecoder:
         tensors['first_iter'].fill_(-1)
         tensors['frozen_errors'].zero_()
         tensors['iter_counter'].zero_()
+        if 'all_done_flag' not in tensors:
+            tensors['all_done_flag'] = torch.zeros(1, dtype=torch.uint8, device=self.device)
+        else:
+            tensors['all_done_flag'].zero_()
         
         # Copy syndromes to device
         tensors['syndrome'][:] = syndromes
@@ -792,21 +797,19 @@ class RelayBPDecoder:
             if (t + 1) % self.cfg.check_every == 0:
                 # For parity path, we need hard_dec updated (done in v2c btile when write_hard=True)
                 self._check_parity_and_select(tensors, B)
-                # Host-side per-lane freezing and exit
-                done_now = tensors['found_count'] >= self.stop_nconv  # [B]
-                newly_done = done_now & (tensors['first_iter'] < 0)
-                # capture first-done iteration index and snapshot winning errors
-                if torch.any(newly_done):
-                    tensors['first_iter'][newly_done] = tensors['iter_counter']
-                    tensors['frozen_errors'][newly_done] = tensors['best_errors'][newly_done]
-                # freeze finished lanes
-                tensors['active'][done_now] = 0
-                tensors['gamma'][done_now] = 0.0
-                tensors['hard_dec'][done_now] = tensors['frozen_errors'][done_now]
-                # advance global iteration counter
+                # Device-side freeze + first-iter capture and bump iter counter
+                freeze_finished_lanes_kernel[(B,)](
+                    tensors['valid_solutions'], tensors['best_errors'],
+                    tensors['hard_dec'], tensors['gamma'], tensors['active'],
+                    tensors['found_count'], tensors['first_iter'], tensors['iter_counter'],
+                    self.stop_nconv, V=self.V,
+                )
                 tensors['iter_counter'] += 1
-                # exit if all lanes done
-                if bool(done_now.all()):
+                # Compute all-done flag on device and read single byte
+                reduce_all_ge_kernel[(1,)](
+                    tensors['found_count'], self.stop_nconv, tensors['all_done_flag'], B
+                )
+                if tensors['all_done_flag'].item():
                     break
         
         # Final parity check after pre-iterations
@@ -814,18 +817,18 @@ class RelayBPDecoder:
             # Ensure hard_dec is fresh before parity
             self._launch_v2c_btile(tensors, B, write_hard=True)
         self._check_parity_and_select(tensors, B)
-        # Freeze/stop exactly like inside the loop (Rust-like), without bumping iter_counter
-        done_now = tensors['found_count'] >= self.stop_nconv
-        newly_done = done_now & (tensors['first_iter'] < 0)
-        if torch.any(newly_done):
-            tensors['first_iter'][newly_done] = tensors['iter_counter']
-            tensors['frozen_errors'][newly_done] = tensors['best_errors'][newly_done]
-        tensors['active'][done_now] = 0
-        tensors['gamma'][done_now] = 0.0
-        tensors['hard_dec'][done_now] = tensors['frozen_errors'][done_now]
-
+        # Device-side freeze without bumping iter_counter
+        freeze_finished_lanes_kernel[(B,)](
+            tensors['valid_solutions'], tensors['best_errors'],
+            tensors['hard_dec'], tensors['gamma'], tensors['active'],
+            tensors['found_count'], tensors['first_iter'], tensors['iter_counter'],
+            self.stop_nconv, V=self.V,
+        )
         # If everyone is done, skip legs entirely and return results now
-        if bool(done_now.all()):
+        reduce_all_ge_kernel[(1,)](
+            tensors['found_count'], self.stop_nconv, tensors['all_done_flag'], B
+        )
+        if tensors['all_done_flag'].item():
             fallback_errors = torch.where(
                 tensors['valid_solutions'].view(-1, 1),
                 tensors['best_errors'],
@@ -870,35 +873,34 @@ class RelayBPDecoder:
                 # Check parity and select solutions only every CHECK_EVERY iterations
                 if (t + 1) % self.cfg.check_every == 0:
                     self._check_parity_and_select(tensors, B)
-                    done_now = tensors['found_count'] >= self.stop_nconv
-                    newly_done = done_now & (tensors['first_iter'] < 0)
-                    if torch.any(newly_done):
-                        tensors['first_iter'][newly_done] = tensors['iter_counter']
-                        tensors['frozen_errors'][newly_done] = tensors['best_errors'][newly_done]
-                    tensors['active'][done_now] = 0
-                    tensors['gamma'][done_now] = 0.0
-                    tensors['hard_dec'][done_now] = tensors['frozen_errors'][done_now]
+                    freeze_finished_lanes_kernel[(B,)](
+                        tensors['valid_solutions'], tensors['best_errors'],
+                        tensors['hard_dec'], tensors['gamma'], tensors['active'],
+                        tensors['found_count'], tensors['first_iter'], tensors['iter_counter'],
+                        self.stop_nconv, V=self.V,
+                    )
                     tensors['iter_counter'] += 1
-                    if bool(done_now.all()):
+                    reduce_all_ge_kernel[(1,)](
+                        tensors['found_count'], self.stop_nconv, tensors['all_done_flag'], B
+                    )
+                    if tensors['all_done_flag'].item():
                         break
             
             # Final parity check after the leg
             if self.cfg.perf == "throughput":
                 self._launch_v2c_btile(tensors, B, write_hard=True)
             self._check_parity_and_select(tensors, B)
-            # Freeze/stop exactly like inside the loop (Rust-like), without bumping iter_counter
-            done_now = tensors['found_count'] >= self.stop_nconv
-            newly_done = done_now & (tensors['first_iter'] < 0)
-            if torch.any(newly_done):
-                tensors['first_iter'][newly_done] = tensors['iter_counter']
-                tensors['frozen_errors'][newly_done] = tensors['best_errors'][newly_done]
-            tensors['active'][done_now] = 0
-            tensors['gamma'][done_now] = 0.0
-            tensors['hard_dec'][done_now] = tensors['frozen_errors'][done_now]
-
-            # Stop-flag path (kept for compatibility)
-            self._launch_stop_flag_kernel(tensors, B)
-            if tensors['stop_flag'].item():  # One tiny sync occasionally
+            # Freeze without bumping iter_counter
+            freeze_finished_lanes_kernel[(B,)](
+                tensors['valid_solutions'], tensors['best_errors'],
+                tensors['hard_dec'], tensors['gamma'], tensors['active'],
+                tensors['found_count'], tensors['first_iter'], tensors['iter_counter'],
+                self.stop_nconv, V=self.V,
+            )
+            reduce_all_ge_kernel[(1,)](
+                tensors['found_count'], self.stop_nconv, tensors['all_done_flag'], B
+            )
+            if tensors['all_done_flag'].item():
                 break
         
         # Prepare output
