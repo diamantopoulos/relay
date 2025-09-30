@@ -340,39 +340,6 @@ def init_messages_kernel(
 
 
 @triton.jit
-def stop_flag_kernel(
-    found_count,      # [B] int32
-    stop_nconv,       # scalar int32
-    out_flag,         # [1] uint8 (out)
-    B                 # scalar int32
-):
-    """Check if all batches have found enough solutions.
-    
-    Args:
-        found_count: [B] number of solutions found per batch
-        stop_nconv: minimum number of solutions required
-        out_flag: [1] output flag (1 if all done, 0 otherwise)
-        B: batch size
-    """
-    pid = tl.program_id(axis=0)
-    
-    if pid == 0:
-        # Vectorized reduction over all batches
-        acc = tl.full((), 1, dtype=tl.int32)
-        tile = 0
-        while tile < B:
-            offs = tile + tl.arange(0, 256)
-            m    = offs < B
-            fc   = tl.load(found_count + offs, mask=m, other=stop_nconv)  # fill with "done"
-            ok   = (fc >= stop_nconv).to(tl.int32)
-            # if any not-ok in tile => min becomes 0
-            acc  = tl.minimum(acc, tl.min(tl.where(m, ok, 1), axis=0))
-            tile += 256
-        
-        tl.store(out_flag, acc.to(tl.uint8))
-
-
-@triton.jit
 def reduce_all_ge_kernel(
     found_count,      # [B] int32
     stop_nconv,       # scalar int32
@@ -397,7 +364,7 @@ def reduce_all_ge_kernel(
 
 @triton.jit
 def freeze_finished_lanes_kernel(
-    valid_solutions, best_errors,           # [B] bool, [B,V] uint8
+    best_errors,           # [B,V] uint8
     hard_dec, gamma, active,                # [B,V] uint8, [B,V] fp32, [B] uint8
     found_count, first_iter, iter_counter,  # [B] int32, [B] int32, scalar int32
     stop_nconv, V: tl.constexpr

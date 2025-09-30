@@ -22,7 +22,7 @@ from .graph import CSRGraph
 from . import autotune as ac
 from .kernels import (
     c2v_min_sum_kernel, v2c_and_marginals_fused_gamma_kernel,
-    parity_per_check_kernel, init_messages_kernel, stop_flag_kernel,
+    parity_per_check_kernel, init_messages_kernel,
     be_to_eb_kernel, eb_to_be_kernel, c2v_min_sum_btile_kernel, v2c_and_gamma_btile_kernel,
     relay_decode_persistent_kernel,
     reduce_all_ge_kernel, freeze_finished_lanes_kernel,
@@ -239,8 +239,7 @@ class RelayBPDecoder:
             'found_count': torch.zeros(B, dtype=torch.int32, device=self.device),
             'valid_solutions': torch.zeros(B, dtype=torch.bool, device=self.device),
             
-            # Device-driven early exit
-            'stop_flag': torch.zeros(1, dtype=torch.uint8, device=self.device),
+            # Device-driven early exit (replaced with all_done_flag later per decode)
         }
         if self.cfg.perf == "throughput":
             # [E,B] transposed message buffers for BTILE kernels
@@ -620,17 +619,6 @@ class RelayBPDecoder:
             B, self.E
         )
     
-    def _launch_stop_flag_kernel(self, tensors: Dict, B: int):
-        """Launch stop flag kernel."""
-        grid = (1,)  # Single program
-        
-        stop_flag_kernel[grid](
-            tensors['found_count'],
-            self.stop_nconv,
-            tensors['stop_flag'],
-            B
-        )
-    
     def _launch_v2c_btile(self, tensors: Dict, B: int, write_hard: bool):
         grid = (self.V, (B + self.cfg.btile - 1) // self.cfg.btile)
         msg_is_fp16 = (self.msg_dtype == torch.float16)
@@ -731,8 +719,6 @@ class RelayBPDecoder:
         # One-time allocations for per-lane freezing and iteration accounting
         if 'first_iter' not in tensors:
             tensors['first_iter'] = torch.full((B,), -1, dtype=torch.int32, device=self.device)
-        if 'frozen_errors' not in tensors:
-            tensors['frozen_errors'] = torch.zeros(B, self.V, dtype=torch.uint8, device=self.device)
         if 'iter_counter' not in tensors:
             tensors['iter_counter'] = torch.zeros((), dtype=torch.int32, device=self.device)
         if 'active' not in tensors:
@@ -741,7 +727,6 @@ class RelayBPDecoder:
         tensors['active'].fill_(1)
         # Reset per-decode iteration accounting and frozen state
         tensors['first_iter'].fill_(-1)
-        tensors['frozen_errors'].zero_()
         tensors['iter_counter'].zero_()
         if 'all_done_flag' not in tensors:
             tensors['all_done_flag'] = torch.zeros(1, dtype=torch.uint8, device=self.device)
@@ -752,7 +737,7 @@ class RelayBPDecoder:
         tensors['syndrome'][:] = syndromes
         
         # Initialize
-        tensors['lambda_'][:] = self.lambda0  # Broadcast prior LLRs
+        tensors['lambda_'].copy_(self.lambda0.expand(B, -1))  # Broadcast prior LLRs robustly
         tensors['best_weights'].fill_(float('inf'))
         tensors['found_count'].zero_()
         tensors['valid_solutions'].zero_()
@@ -799,7 +784,7 @@ class RelayBPDecoder:
                 self._check_parity_and_select(tensors, B)
                 # Device-side freeze + first-iter capture and bump iter counter
                 freeze_finished_lanes_kernel[(B,)](
-                    tensors['valid_solutions'], tensors['best_errors'],
+                    tensors['best_errors'],
                     tensors['hard_dec'], tensors['gamma'], tensors['active'],
                     tensors['found_count'], tensors['first_iter'], tensors['iter_counter'],
                     self.stop_nconv, V=self.V,
@@ -819,7 +804,7 @@ class RelayBPDecoder:
         self._check_parity_and_select(tensors, B)
         # Device-side freeze without bumping iter_counter
         freeze_finished_lanes_kernel[(B,)](
-            tensors['valid_solutions'], tensors['best_errors'],
+            tensors['best_errors'],
             tensors['hard_dec'], tensors['gamma'], tensors['active'],
             tensors['found_count'], tensors['first_iter'], tensors['iter_counter'],
             self.stop_nconv, V=self.V,
@@ -874,7 +859,7 @@ class RelayBPDecoder:
                 if (t + 1) % self.cfg.check_every == 0:
                     self._check_parity_and_select(tensors, B)
                     freeze_finished_lanes_kernel[(B,)](
-                        tensors['valid_solutions'], tensors['best_errors'],
+                        tensors['best_errors'],
                         tensors['hard_dec'], tensors['gamma'], tensors['active'],
                         tensors['found_count'], tensors['first_iter'], tensors['iter_counter'],
                         self.stop_nconv, V=self.V,
@@ -892,7 +877,7 @@ class RelayBPDecoder:
             self._check_parity_and_select(tensors, B)
             # Freeze without bumping iter_counter
             freeze_finished_lanes_kernel[(B,)](
-                tensors['valid_solutions'], tensors['best_errors'],
+                tensors['best_errors'],
                 tensors['hard_dec'], tensors['gamma'], tensors['active'],
                 tensors['found_count'], tensors['first_iter'], tensors['iter_counter'],
                 self.stop_nconv, V=self.V,
