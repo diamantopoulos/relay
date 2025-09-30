@@ -39,91 +39,92 @@ def c2v_min_sum_kernel(
             b = idx // C
             i = idx % C
 
-            # Per-lane active mask
+            # Early-out for inactive lanes - check active status first
             act_b = tl.load(active + b)
-            row_start = tl.load(chk_ptr + i)
-            row_end   = tl.load(chk_ptr + i + 1)
-            deg = row_end - row_start
-            deg_is_one = deg == 1
-            # If inactive, force deg=0 to skip work
-            deg = tl.where(act_b == 0, 0, deg)
-            if deg > 0:
-                # ---------- PASS 1: parity + min1/min2/argmin + cnt_min1 (vectorized) ----------
-                neg_parity = tl.zeros((), dtype=tl.int32)
-                min1 = tl.full((), 1e30, dtype=tl.float32)  # fp32 for accuracy
-                min2 = tl.full((), 1e30, dtype=tl.float32)  # fp32 for accuracy
-                cnt1 = tl.zeros((), dtype=tl.int32)
-                argmin_e = tl.full((), -1,   dtype=tl.int32)
+            if act_b != 0:
+                # Only read CSR data for active lanes
+                row_start = tl.load(chk_ptr + i)
+                row_end   = tl.load(chk_ptr + i + 1)
+                deg = row_end - row_start
+                if deg > 0:
+                    deg_is_one = deg == 1
+                    # ---------- PASS 1: parity + min1/min2/argmin + cnt_min1 (vectorized) ----------
+                    neg_parity = tl.zeros((), dtype=tl.int32)
+                    min1 = tl.full((), 1e30, dtype=tl.float32)  # fp32 for accuracy
+                    min2 = tl.full((), 1e30, dtype=tl.float32)  # fp32 for accuracy
+                    cnt1 = tl.zeros((), dtype=tl.int32)
+                    argmin_e = tl.full((), -1,   dtype=tl.int32)
 
-                tile = row_start
-                while tile < row_end:
-                    offs = tile + tl.arange(0, BLOCK_SIZE)
-                    m    = offs < row_end
-                    e    = tl.load(chk_edges + offs, mask=m, other=0)
-                    mu_e = tl.load(mu + b*E + e,     mask=m, other=0.0)
+                    tile = row_start
+                    while tile < row_end:
+                        offs = tile + tl.arange(0, BLOCK_SIZE)
+                        m    = offs < row_end
+                        e    = tl.load(chk_edges + offs, mask=m, other=0)
+                        mu_e = tl.load(mu + b*E + e,     mask=m, other=0.0)
 
-                    # parity via xor of tile parity bits
-                    tile_par = (tl.sum((mu_e < 0.0) & m, axis=0).to(tl.int32) & 1)
-                    neg_parity = neg_parity ^ tile_par
+                        # parity via xor of tile parity bits
+                        tile_par = (tl.sum((mu_e < 0.0) & m, axis=0).to(tl.int32) & 1)
+                        neg_parity = neg_parity ^ tile_par
 
-                    a       = tl.abs(mu_e.to(tl.float32))
-                    a_mask  = tl.where(m, a, 1e30)
+                        a       = tl.abs(mu_e.to(tl.float32))
+                        a_mask  = tl.where(m, a, 1e30)
 
-                    # tile min1/argmin and tie count
-                    pos1    = tl.argmax(-a_mask, axis=0)
-                    min1_t  = tl.max(-a_mask, axis=0) * (-1.0)
-                    e1_t    = tl.load(chk_edges + tile + pos1)
-                    cnt1_t  = tl.sum(a_mask == min1_t, axis=0).to(tl.int32)
-                    # tile min2 (mask just one occurrence of min1)
-                    a_mask2 = tl.where(tl.arange(0, BLOCK_SIZE) == pos1, 1e30, a_mask)
-                    min2_t  = tl.min(a_mask2, axis=0)
+                        # tile min1/argmin and tie count
+                        pos1    = tl.argmax(-a_mask, axis=0)
+                        min1_t  = tl.max(-a_mask, axis=0) * (-1.0)
+                        e1_t    = tl.load(chk_edges + tile + pos1)
+                        cnt1_t  = tl.sum(a_mask == min1_t, axis=0).to(tl.int32)
+                        # tile min2 (mask just one occurrence of min1)
+                        a_mask2 = tl.where(tl.arange(0, BLOCK_SIZE) == pos1, 1e30, a_mask)
+                        min2_t  = tl.min(a_mask2, axis=0)
 
-                    # merge into global running mins and counts
-                    better1 = min1_t < min1
-                    argmin_e = tl.where(better1, e1_t, argmin_e)
-                    cnt1     = tl.where(better1, cnt1_t, tl.where(min1_t == min1, cnt1 + cnt1_t, cnt1))
-                    min2     = tl.where(
-                        better1,
-                        tl.minimum(min1, min2_t),
-                        tl.where(min1_t == min1, tl.minimum(min2, min2_t), tl.minimum(min2, min1_t))
-                    )
-                    min1     = tl.where(better1, min1_t, min1)
+                        # merge into global running mins and counts
+                        better1 = min1_t < min1
+                        argmin_e = tl.where(better1, e1_t, argmin_e)
+                        cnt1     = tl.where(better1, cnt1_t, tl.where(min1_t == min1, cnt1 + cnt1_t, cnt1))
+                        min2     = tl.where(
+                            better1,
+                            tl.minimum(min1, min2_t),
+                            tl.where(min1_t == min1, tl.minimum(min2, min2_t), tl.minimum(min2, min1_t))
+                        )
+                        min1     = tl.where(better1, min1_t, min1)
 
-                    tile += BLOCK_SIZE
+                        tile += BLOCK_SIZE
 
-                # include syndrome bit in sign product
-                syn = tl.load(syndrome + b*C + i).to(tl.int32) & 1
-                # parity bit = (neg_parity & 1) XOR syn
-                par_bit = ((neg_parity & 1) ^ syn)
-                sign_prod = tl.where(par_bit == 0, 1.0, -1.0)
+                    # include syndrome bit in sign product
+                    syn = tl.load(syndrome + b*C + i).to(tl.int32) & 1
+                    # parity bit = (neg_parity & 1) XOR syn
+                    par_bit = ((neg_parity & 1) ^ syn)
+                    sign_prod = tl.where(par_bit == 0, 1.0, -1.0)
 
-                # ---------- PASS 2: write nu (vectorized) ----------
-                tile = row_start
-                while tile < row_end:
-                    offs = tile + tl.arange(0, BLOCK_SIZE)
-                    m    = offs < row_end
-                    e    = tl.load(chk_edges + offs, mask=m, other=0)
-                    mu_e = tl.load(mu + b*E + e,     mask=m, other=0.0)
-                    sgn_mu = tl.where(mu_e >= 0.0, 1.0, -1.0)
+                    # ---------- PASS 2: write nu (vectorized) ----------
+                    tile = row_start
+                    while tile < row_end:
+                        offs = tile + tl.arange(0, BLOCK_SIZE)
+                        m    = offs < row_end
+                        e    = tl.load(chk_edges + offs, mask=m, other=0)
+                        mu_e = tl.load(mu + b*E + e,     mask=m, other=0.0)
+                        sgn_mu = tl.where(mu_e >= 0.0, 1.0, -1.0)
 
-                    is_argmin = (e == argmin_e)
-                    use_min2  = (cnt1 == 1) & is_argmin
-                    out_mag   = tl.where(use_min2, min2, min1)
-                    # Degree-1 checks must send zero.
-                    out_mag   = tl.where(deg_is_one, 0.0, out_mag)
+                        is_argmin = (e == argmin_e)
+                        use_min2  = (cnt1 == 1) & is_argmin
+                        out_mag   = tl.where(use_min2, min2, min1)
+                        # Degree-1 checks must send zero.
+                        out_mag   = tl.where(deg_is_one, 0.0, out_mag)
 
-                    if use_alpha:
-                        out_mag = alpha * out_mag
-                    if use_beta:
-                        out_mag = tl.maximum(out_mag - beta, 0.0)
+                        if use_alpha:
+                            out_mag = alpha * out_mag
+                        if use_beta:
+                            out_mag = tl.maximum(out_mag - beta, 0.0)
 
-                    nu_e = (sign_prod * sgn_mu) * out_mag
-                    if msg_is_fp16:
-                        tl.store(nu + b*E + e, nu_e.to(tl.float16), mask=m)
-                    else:
-                        tl.store(nu + b*E + e, nu_e, mask=m)
+                        nu_e = (sign_prod * sgn_mu) * out_mag
+                        if msg_is_fp16:
+                            tl.store(nu + b*E + e, nu_e.to(tl.float16), mask=m)
+                        else:
+                            tl.store(nu + b*E + e, nu_e, mask=m)
 
-                    tile += BLOCK_SIZE
+                        tile += BLOCK_SIZE
+                # else: inactive lane — do nothing for this (b,i)
 
 
 
@@ -160,49 +161,50 @@ def v2c_and_marginals_fused_gamma_kernel(
             b = idx // V
             j = idx % V
 
-            # Per-lane active mask
+            # Early-out for inactive lanes - check active status first
             act_b = tl.load(active + b)
-            row_start = tl.load(var_ptr + j)
-            row_end   = tl.load(var_ptr + j + 1)
-            lam_bj    = tl.load(lam + b*V + j)
-            # If inactive, set row range empty to skip work
-            row_end = tl.where(act_b == 0, row_start, row_end)
+            if act_b != 0:
+                # Only read CSR data for active lanes
+                row_start = tl.load(var_ptr + j)
+                row_end   = tl.load(var_ptr + j + 1)
+                lam_bj    = tl.load(lam + b*V + j)
 
-            # PASS 1: sum incoming nu (vectorized)
-            sum_nu = tl.zeros((), dtype=tl.float32)
-            tile = row_start
-            while tile < row_end:
-                offs = tile + tl.arange(0, BLOCK_SIZE)
-                m    = offs < row_end
-                e    = tl.load(var_edges + offs, mask=m, other=0)
-                nu_e = tl.load(nu + b*E + e,     mask=m, other=0.0)
-                sum_nu += tl.sum(tl.where(m, nu_e.to(tl.float32), 0.0), axis=0)
-                tile += BLOCK_SIZE
+                # PASS 1: sum incoming nu (vectorized)
+                sum_nu = tl.zeros((), dtype=tl.float32)
+                tile = row_start
+                while tile < row_end:
+                    offs = tile + tl.arange(0, BLOCK_SIZE)
+                    m    = offs < row_end
+                    e    = tl.load(var_edges + offs, mask=m, other=0)
+                    nu_e = tl.load(nu + b*E + e,     mask=m, other=0.0)
+                    sum_nu += tl.sum(tl.where(m, nu_e.to(tl.float32), 0.0), axis=0)
+                    tile += BLOCK_SIZE
 
-            M_bj_curr = lam_bj + sum_nu
-            if STORE_M:
-                tl.store(M + b*V + j, M_bj_curr)  # Only store if needed
-            tl.store(hard_dec + b*V + j, (M_bj_curr < 0.0).to(tl.uint8))
+                M_bj_curr = lam_bj + sum_nu
+                if STORE_M:
+                    tl.store(M + b*V + j, M_bj_curr)  # Only store if needed
+                tl.store(hard_dec + b*V + j, (M_bj_curr < 0.0).to(tl.uint8))
 
-            # FUSED GAMMA MIXING with PREVIOUS marginals: lam = (1-γ)*λ0 + γ*M_prev
-            g_bj = tl.load(gamma + b*V + j)           # [B,V]
-            lam0_j = tl.load(lam0 + j)                # [1,V]
-            lam_bj_new = (1.0 - g_bj) * lam0_j + g_bj * M_bj_curr
-            tl.store(lam + b*V + j, lam_bj_new)
+                # FUSED GAMMA MIXING with PREVIOUS marginals: lam = (1-γ)*λ0 + γ*M_prev
+                g_bj = tl.load(gamma + b*V + j)           # [B,V]
+                lam0_j = tl.load(lam0 + j)                # [1,V]
+                lam_bj_new = (1.0 - g_bj) * lam0_j + g_bj * M_bj_curr
+                tl.store(lam + b*V + j, lam_bj_new)
 
-            # PASS 2: write mu = lam + (sum_nu - nu_e) using NEW lam (vectorized)
-            tile = row_start
-            while tile < row_end:
-                offs = tile + tl.arange(0, BLOCK_SIZE)
-                m    = offs < row_end
-                e    = tl.load(var_edges + offs, mask=m, other=0)
-                nu_e = tl.load(nu + b*E + e,     mask=m, other=0.0)
-                mu_e = lam_bj_new + (sum_nu - nu_e.to(tl.float32))  # Convert to fp32 for computation
-                if msg_is_fp16:
-                    tl.store(mu + b*E + e, mu_e.to(tl.float16), mask=m)
-                else:
-                    tl.store(mu + b*E + e, mu_e, mask=m)
-                tile += BLOCK_SIZE
+                # PASS 2: write mu = lam + (sum_nu - nu_e) using NEW lam (vectorized)
+                tile = row_start
+                while tile < row_end:
+                    offs = tile + tl.arange(0, BLOCK_SIZE)
+                    m    = offs < row_end
+                    e    = tl.load(var_edges + offs, mask=m, other=0)
+                    nu_e = tl.load(nu + b*E + e,     mask=m, other=0.0)
+                    mu_e = lam_bj_new + (sum_nu - nu_e.to(tl.float32))  # Convert to fp32 for computation
+                    if msg_is_fp16:
+                        tl.store(mu + b*E + e, mu_e.to(tl.float16), mask=m)
+                    else:
+                        tl.store(mu + b*E + e, mu_e, mask=m)
+                    tile += BLOCK_SIZE
+            # else: inactive — do nothing (no loads, no stores)
 
 
 @triton.jit
@@ -357,6 +359,77 @@ def parity_from_hard_kernel(
             tl.store(check_ok + b*C + i, ok)
 
 @triton.jit
+def parity_from_hard_compact_kernel(
+    hard_dec,                # [B,V] uint8
+    chk_ptr, chk_edges,      # CSR over checks -> edge IDs
+    edge_var,                # [E] var index per edge
+    syndrome,                # [B,C] uint8
+    check_ok,                # [B,C] uint8 (out)
+    active_idx,              # [B_active] int32 - compact list of active batch indices
+    B, B_active, C, V, E,
+    BLOCK_SIZE: tl.constexpr,
+    ROWS_PER_CHK: tl.constexpr,  # Number of check rows to process per program
+):
+    """Parity check kernel loading bits from hard_dec (uint8) for active lanes only."""
+    pid = tl.program_id(axis=0)
+    base = pid * ROWS_PER_CHK
+    for r in tl.static_range(0, ROWS_PER_CHK):
+        idx = base + r
+        if idx < B_active * C:
+            b_active = idx // C
+            i = idx % C
+            
+            # Map active batch index to actual batch index
+            b = tl.load(active_idx + b_active)
+
+            row_start = tl.load(chk_ptr + i)
+            row_end   = tl.load(chk_ptr + i + 1)
+            par = tl.zeros((), dtype=tl.int32)
+
+            tile = row_start
+            while tile < row_end:
+                offs = tile + tl.arange(0, BLOCK_SIZE)
+                m    = offs < row_end
+                e    = tl.load(chk_edges + offs, mask=m, other=0)
+                v    = tl.load(edge_var + e,     mask=m, other=0)
+                bits = tl.load(hard_dec + b*V + v, mask=m, other=0).to(tl.int32) & 1
+                par  = par ^ (tl.sum(tl.where(m, bits, 0), axis=0) & 1)
+                tile += BLOCK_SIZE
+
+            syn = tl.load(syndrome + b*C + i).to(tl.int32) & 1
+            ok  = (par == syn).to(tl.uint8)
+            tl.store(check_ok + b*C + i, ok)
+
+@triton.jit
+def zero_check_ok_inactive_kernel(
+    check_ok,    # [B,C] uint8
+    active,      # [B] uint8
+    B, C,
+    BLOCK_B: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """Zero out check_ok for inactive lanes to ensure clean parity statistics."""
+    pid_b = tl.program_id(0)
+    pid_c = tl.program_id(1)
+
+    b_idx = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    c_idx = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+
+    mb = b_idx < B
+    mc = c_idx < C
+
+    # load active flags for this tile's rows
+    act = tl.load(active + b_idx, mask=mb, other=0)
+    inactive_rows = (act == 0) & mb
+
+    # broadcast to 2D tile
+    bb = b_idx[:, None]
+    cc = c_idx[None, :]
+    mask2d = inactive_rows[:, None] & mc[None, :]
+
+    tl.store(check_ok + bb * C + cc, 0, mask=mask2d)
+
+@triton.jit
 def init_messages_kernel(
     mu, nu,
     N,
@@ -485,8 +558,8 @@ def c2v_min_sum_btile_kernel(
     muT, nuT,                 # [E,B]
     chk_ptr, chk_edges,       # CSR over checks -> edge IDs
     syndrome,                 # [B,C] (uint8)
-    active,                   # [B] uint8 mask
-    B, C, E,
+    active_idx,               # [B_active] int32 - compact list of active batch indices
+    B, B_active, C, E,
     alpha, beta,
     use_alpha: tl.constexpr, use_beta: tl.constexpr,
     msg_is_fp16: tl.constexpr,
@@ -500,10 +573,10 @@ def c2v_min_sum_btile_kernel(
     if i >= C:
         return
     b0 = btile_id * BTILE
-    bs = b0 + tl.arange(0, BTILE)
-    mb = bs < B
-    active_bs = tl.load(active + bs, mask=mb, other=0)
-    mb_act = mb & (active_bs != 0)
+    pos = b0 + tl.arange(0, BTILE)
+    mpos = pos < B_active
+    bs = tl.load(active_idx + pos, mask=mpos, other=0)
+    mb = mpos  # replace old mb; no need to AND with active[] anymore
 
     row_start = tl.load(chk_ptr + i)
     row_end   = tl.load(chk_ptr + i + 1)
@@ -525,7 +598,7 @@ def c2v_min_sum_btile_kernel(
         mrow = offs < row_end
         evec = tl.load(chk_edges + offs, mask=mrow, other=0)             # [BLOCK_SIZE]
         # Build 2D mask and gather mu over edges×BTILE
-        mask2d = (mrow[:, None]) & (mb_act[None, :])
+        mask2d = (mrow[:, None]) & (mb[None, :])
         mu_tile = tl.load(muT + (evec[:, None]) * B + bs[None, :], mask=mask2d, other=0.0)  # [BLOCK_SIZE, BTILE]
         # tile parity via xor of tile parity bits
         tile_par = (tl.sum((mu_tile < 0.0) & mask2d, axis=0).to(tl.int32) & 1)
@@ -546,7 +619,7 @@ def c2v_min_sum_btile_kernel(
         min1 = tl.where(better1, min1_t, min1)
         tile += BLOCK_SIZE
 
-    syn = tl.load(syndrome + bs * C + i, mask=mb_act, other=0).to(tl.int32) & 1
+    syn = tl.load(syndrome + bs * C + i, mask=mb, other=0).to(tl.int32) & 1
     par_bit = ((neg_parity & 1) ^ syn)
     sign_prod = tl.where(par_bit == 0, 1.0, -1.0)
 
@@ -556,7 +629,7 @@ def c2v_min_sum_btile_kernel(
         offs = tile + tl.arange(0, BLOCK_SIZE)
         mrow = offs < row_end
         evec = tl.load(chk_edges + offs, mask=mrow, other=0)
-        mask2d = (mrow[:, None]) & (mb_act[None, :])
+        mask2d = (mrow[:, None]) & (mb[None, :])
         mu_tile = tl.load(muT + (evec[:, None]) * B + bs[None, :], mask=mask2d, other=0.0)
         sgn = tl.where(mu_tile >= 0.0, 1.0, -1.0)
         # Identify min1 lanes per edge×batch and apply correct tie logic
@@ -585,8 +658,8 @@ def v2c_and_gamma_btile_kernel(
     var_ptr, var_edges,       # CSR over vars -> edge IDs
     lam, lam0, gamma,         # [B,V], [V], [B,V]
     M, hard_dec,              # [B,V], [B,V]
-    active,                   # [B] uint8 mask
-    B, V, E,
+    active_idx,               # [B_active] int32 - compact list of active batch indices
+    B, B_active, V, E,
     msg_is_fp16: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BTILE: tl.constexpr,
@@ -601,10 +674,10 @@ def v2c_and_gamma_btile_kernel(
     if j >= V:
         return
     b0 = btile_id * BTILE
-    bs = b0 + tl.arange(0, BTILE)
-    mb = bs < B
-    active_bs = tl.load(active + bs, mask=mb, other=0)
-    mb_act = mb & (active_bs != 0)
+    pos = b0 + tl.arange(0, BTILE)
+    mpos = pos < B_active
+    bs = tl.load(active_idx + pos, mask=mpos, other=0)
+    mb = mpos  # replace old mb; no need to AND with active[] anymore
 
     row_start = tl.load(var_ptr + j)
     row_end   = tl.load(var_ptr + j + 1)
@@ -616,24 +689,24 @@ def v2c_and_gamma_btile_kernel(
         offs = tile + tl.arange(0, BLOCK_SIZE)
         mrow = offs < row_end
         evec = tl.load(var_edges + offs, mask=mrow, other=0)                 # [BLOCK_SIZE]
-        mask2d = (mrow[:, None]) & (mb_act[None, :])
+        mask2d = (mrow[:, None]) & (mb[None, :])
         nu_tile = tl.load(nuT + (evec[:, None]) * B + bs[None, :], mask=mask2d, other=0.0)
         sum_nu += tl.sum(tl.where(mask2d, nu_tile.to(tl.float32), 0.0), axis=0)
         tile += BLOCK_SIZE
 
     # beliefs and gamma mix (fp32 compute)
-    lam_bj = tl.load(lam + bs * V + j, mask=mb_act, other=0.0)
+    lam_bj = tl.load(lam + bs * V + j, mask=mb, other=0.0)
     M_bj = lam_bj + sum_nu
     # Conditionally store M to avoid bandwidth in hot path
     if STORE_M:
-        tl.store(M + bs * V + j, M_bj, mask=mb_act)
+        tl.store(M + bs * V + j, M_bj, mask=mb)
     # Optionally update hard_dec if requested (to avoid bandwidth in hot path)
     if WRITE_HARD:
-        tl.store(hard_dec + bs * V + j, (M_bj < 0.0).to(tl.uint8), mask=mb_act)
-    g_bj = tl.load(gamma + bs * V + j, mask=mb_act, other=0.0)
+        tl.store(hard_dec + bs * V + j, (M_bj < 0.0).to(tl.uint8), mask=mb)
+    g_bj = tl.load(gamma + bs * V + j, mask=mb, other=0.0)
     lam0_j = tl.load(lam0 + j)
     lam_new = (1.0 - g_bj) * lam0_j + g_bj * M_bj
-    tl.store(lam + bs * V + j, lam_new, mask=mb_act)
+    tl.store(lam + bs * V + j, lam_new, mask=mb)
 
     # write muT for each edge lane (vectorized)
     tile = row_start
@@ -641,7 +714,7 @@ def v2c_and_gamma_btile_kernel(
         offs = tile + tl.arange(0, BLOCK_SIZE)
         mrow = offs < row_end
         evec = tl.load(var_edges + offs, mask=mrow, other=0)
-        mask2d = (mrow[:, None]) & (mb_act[None, :])
+        mask2d = (mrow[:, None]) & (mb[None, :])
         nu_tile = tl.load(nuT + (evec[:, None]) * B + bs[None, :], mask=mask2d, other=0.0)
         mu_tile = lam_new[None, :] + (sum_nu[None, :] - nu_tile.to(tl.float32))
         if msg_is_fp16:

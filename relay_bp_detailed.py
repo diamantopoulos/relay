@@ -387,6 +387,7 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
             'distance': int(distance),
             'rounds': int(rounds),
             'error_rate': float(error_rate),
+            'batch': int(batch),
         }
     }
     
@@ -529,13 +530,13 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
 
     sampler = dem.compile_sampler(seed=seed)
     # Untimed warmup to avoid including JIT/tuning in timings
-    #try:
-    #    _det, _obs, _warm_errors = sampler.sample(batch, return_errors=True)
-    #    _ = observable_decoder.from_errors_decode_observables_detailed_batch(
-    #        _warm_errors.astype(np.uint8), parallel=parallel
-    #    )
-    #except Exception:
-    #    pass
+    try:
+        _det, _obs, _warm_errors = sampler.sample(batch, return_errors=True)
+        _ = observable_decoder.from_errors_decode_observables_detailed_batch(
+            _warm_errors.astype(np.uint8), parallel=parallel
+        )
+    except Exception:
+        pass
     print(f"Collecting until {target_errors} errors or {max_shots} shots...")
     start_time = time.time()
 
@@ -627,6 +628,7 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
             'error_rate': float(error_rate),
             'max_iter': int(max_iter),
             'alpha': None if alpha is None else float(alpha),
+            'batch': int(batch),
         }
     }
     if runtime_per_shot is not None:
