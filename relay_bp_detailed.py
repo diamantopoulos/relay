@@ -390,7 +390,6 @@ def run_plain_bp_detailed(args):
         seed=args.seed,
         backend=args.backend,
         perf=args.perf,
-        algo=args.algo,
     )
 
 def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
