@@ -569,6 +569,8 @@ class RelayBPDecoder:
     
     def _launch_parity_check_kernel(self, tensors: Dict, B: int):
         """Launch parity check kernel with simple cache-based autotuning."""
+        # Sanity check: throughput mode must use parity_from_hard_kernel
+        assert not (self.cfg.perf == "throughput"), "Throughput mode must use parity_from_hard_kernel"
         total = B * self.C
         grid = ((total + self.cfg.rows_per_chk - 1) // self.cfg.rows_per_chk,)
 
@@ -620,11 +622,11 @@ class RelayBPDecoder:
             BLOCK=BLOCK,
         )
     
-    def _launch_v2c_btile(self, tensors: Dict, B: int, write_hard: bool):
+    def _launch_v2c_btile(self, tensors: Dict, B: int, write_hard: bool, store_m: bool = True):
         grid = (self.V, (B + self.cfg.btile - 1) // self.cfg.btile)
         msg_is_fp16 = (self.msg_dtype == torch.float16)
-        problem_key = {"B": B, "V": self.V, "E": self.E, "msg_is_fp16": msg_is_fp16, "BTILE": self.cfg.btile, "WRITE_HARD": write_hard}
-        meta_base = dict(B=B, V=self.V, E=self.E, msg_is_fp16=msg_is_fp16, WRITE_HARD=write_hard, BTILE=int(self.cfg.btile))
+        problem_key = {"B": B, "V": self.V, "E": self.E, "msg_is_fp16": msg_is_fp16, "BTILE": self.cfg.btile, "WRITE_HARD": write_hard, "STORE_M": store_m}
+        meta_base = dict(B=B, V=self.V, E=self.E, msg_is_fp16=msg_is_fp16, WRITE_HARD=write_hard, STORE_M=store_m, BTILE=int(self.cfg.btile))
         saved = ac.try_get_saved("v2c_and_gamma_btile_kernel", problem_key)
         if saved is None:
             from .autotune import build_btile_compute_configs
@@ -669,10 +671,48 @@ class RelayBPDecoder:
             num_stages=int(saved.get('num_stages', 0)),
         )
     
+    def _launch_parity_from_hard_kernel(self, tensors: Dict, B: int):
+        """Launch parity check using hard_dec (for throughput mode)."""
+        total = B * self.C
+        grid = ((total + self.cfg.rows_per_chk - 1) // self.cfg.rows_per_chk,)
+        problem_key = {"B": B, "C": self.C, "V": self.V, "E": self.E, "ROWS_PER_CHK": self.cfg.rows_per_chk}
+        meta_base = dict(B=B, C=self.C, V=self.V, E=self.E, ROWS_PER_CHK=self.cfg.rows_per_chk)
+
+        saved = ac.try_get_saved("parity_from_hard_kernel", problem_key)
+        if saved is None:
+            from .autotune import build_parity_configs
+            cfgs = [dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages) for c in build_parity_configs()]
+            best = ac.bench_and_select(
+                kernel=parity_from_hard_kernel,
+                grid=grid,
+                args=(tensors['hard_dec'], self.graph.chk_ptr, self.graph.chk_edges, self.graph.edge_var,
+                      tensors['syndrome'], tensors['check_ok']),
+                meta_base=meta_base,
+                configs=cfgs,
+                number=20,
+            )
+            ac.set_saved("parity_from_hard_kernel", problem_key, best)
+            saved = best
+
+        parity_from_hard_kernel[grid](
+            tensors['hard_dec'],
+            self.graph.chk_ptr, self.graph.chk_edges, self.graph.edge_var,
+            tensors['syndrome'], tensors['check_ok'],
+            **meta_base,
+            BLOCK_SIZE=int(saved['BLOCK_SIZE']),
+            num_warps=int(saved.get('num_warps', 0)),
+            num_stages=int(saved.get('num_stages', 0)),
+        )
+    
     def _check_parity_and_select(self, tensors: Dict, B: int):
         """Check parity and select best solutions (device-only, no return)."""
-        # Launch parity check
-        self._launch_parity_check_kernel(tensors, B)
+        # Launch the right parity kernel
+        if self.cfg.perf == "throughput":
+            # parity over hard_dec (since M may not be stored)
+            self._launch_parity_from_hard_kernel(tensors, B)
+        else:
+            # parity over M
+            self._launch_parity_check_kernel(tensors, B)
         
         # Check if all parity constraints are satisfied
         valid = tensors['check_ok'].view(B, self.C).all(dim=1)  # [B] bool
@@ -681,8 +721,13 @@ class RelayBPDecoder:
         prev_valid = tensors['valid_solutions'].clone()
 
         if idx.numel() > 0:
-            # Only compute weights for valid indices; derive current hard decisions from M
-            curr_hd = (tensors['M'][idx] < 0).to(torch.uint8)
+            # Only compute weights for valid indices; derive current hard decisions
+            if self.cfg.perf == "throughput":
+                # In throughput mode, use hard_dec directly (M is not stored)
+                curr_hd = tensors['hard_dec'][idx]
+            else:
+                # In default mode, derive from M
+                curr_hd = (tensors['M'][idx] < 0).to(torch.uint8)
             cand_w = (curr_hd.float() * self.wj).sum(dim=1)  # [K]
 
             better = cand_w < tensors['best_weights'][idx]
@@ -776,7 +821,7 @@ class RelayBPDecoder:
                 # BTILE C2V and V2C fully in [E,B]
                 self._launch_c2v_btile(tensors, B)
                 on_cadence = ((t+1) % self.cfg.check_every == 0)
-                self._launch_v2c_btile(tensors, B, write_hard=on_cadence)
+                self._launch_v2c_btile(tensors, B, write_hard=on_cadence, store_m=False)
             else:
                 self._launch_c2v_kernel(tensors, B)
                 # Fused V2C + gamma mixing updates lambda_ internally
@@ -803,7 +848,7 @@ class RelayBPDecoder:
         # Final parity check after pre-iterations
         # In throughput mode, parity uses hard_dec snapshot; enable write and use the hard kernel
         if self.cfg.perf == "throughput":
-            self._launch_v2c_btile(tensors, B, write_hard=True)
+            self._launch_v2c_btile(tensors, B, write_hard=True, store_m=False)
             # Parity over hard_dec for lower bandwidth
             total = B * self.C
             grid = ((total + self.cfg.rows_per_chk - 1) // self.cfg.rows_per_chk,)
@@ -913,7 +958,7 @@ class RelayBPDecoder:
             
             # Final parity check after the leg
             if self.cfg.perf == "throughput":
-                self._launch_v2c_btile(tensors, B, write_hard=True)
+                self._launch_v2c_btile(tensors, B, write_hard=True, store_m=False)
             self._check_parity_and_select(tensors, B)
             # Freeze without bumping iter_counter
             freeze_finished_lanes_kernel[(B,)](

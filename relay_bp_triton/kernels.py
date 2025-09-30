@@ -591,6 +591,7 @@ def v2c_and_gamma_btile_kernel(
     BLOCK_SIZE: tl.constexpr,
     BTILE: tl.constexpr,
     WRITE_HARD: tl.constexpr,
+    STORE_M: tl.constexpr,
 ):
     """Variable-to-check + gamma mixing on [E,B] layout, vectorized across BTILE.
     For each variable j and batch tile bs, compute sum_nu, M, lambda update, and write muT.
@@ -623,7 +624,9 @@ def v2c_and_gamma_btile_kernel(
     # beliefs and gamma mix (fp32 compute)
     lam_bj = tl.load(lam + bs * V + j, mask=mb_act, other=0.0)
     M_bj = lam_bj + sum_nu
-    tl.store(M + bs * V + j, M_bj, mask=mb_act)
+    # Conditionally store M to avoid bandwidth in hot path
+    if STORE_M:
+        tl.store(M + bs * V + j, M_bj, mask=mb_act)
     # Optionally update hard_dec if requested (to avoid bandwidth in hot path)
     if WRITE_HARD:
         tl.store(hard_dec + bs * V + j, (M_bj < 0.0).to(tl.uint8), mask=mb_act)
