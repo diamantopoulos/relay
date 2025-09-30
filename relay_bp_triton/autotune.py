@@ -1,13 +1,14 @@
-import json
 import os
+import json
 import hashlib
 import platform
 from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-
-import torch
+import itertools, random
 import triton
 import triton.testing as ttesting
+import torch
 
 
 DEFAULT_CACHE = Path(os.getenv("RELAY_TUNE_CACHE", "~/.cache/relay_bp_tune.json")).expanduser()
@@ -31,13 +32,11 @@ def _fingerprint() -> Dict[str, Any]:
                 "total_mem": int(getattr(props, "total_memory", 0)),
                 "multi_processor_count": int(getattr(props, "multi_processor_count", 0)),
             }
-            # UUID may not exist on all builds
             uuid = getattr(props, "uuid", None)
             if uuid is not None:
                 device_info["uuid"] = str(uuid)
             backend = "cuda" if torch.version.cuda is not None else "rocm"
         except Exception:
-            # Fallback minimal CUDA info
             backend = "cuda" if torch.version.cuda is not None else ("rocm" if getattr(torch.version, "hip", None) else "gpu")
             dev = torch.cuda.current_device()
             device_info = {
@@ -45,18 +44,16 @@ def _fingerprint() -> Dict[str, Any]:
                 "device_name": torch.cuda.get_device_name(dev),
             }
     else:
-        # CPU-only environment
         device_info = {"device_name": "cpu"}
 
     return {
         "backend": backend,
         **device_info,
-        "driver_cuda": torch.version.cuda,           # may be None on ROCm
+        "driver_cuda": torch.version.cuda,
         "driver_hip": getattr(torch.version, "hip", None),
         "torch": torch.__version__,
         "triton": triton.__version__,
         "python": platform.python_version(),
-        # Optional manual override
         "arch_override": os.getenv("SM", ""),
     }
 
@@ -86,13 +83,28 @@ def save_cache(table: Dict[str, Dict[str, Any]]):
 def try_get_saved(kernel_name: str, problem_key: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     table = load_cache()
     key = _make_cache_key(kernel_name, problem_key)
-    return table.get(key)
+    entry = table.get(key)
+    if entry is None:
+        return None
+    # Backward-compat: old format stored the tuned meta directly
+    if isinstance(entry, dict) and 'selected' in entry:
+        return entry['selected']
+    return entry
 
 
 def set_saved(kernel_name: str, problem_key: Dict[str, Any], meta: Dict[str, Any]):
     table = load_cache()
     key = _make_cache_key(kernel_name, problem_key)
-    table[key] = meta
+    # Rich record with context for human readability
+    record = {
+        "kernel": str(kernel_name),
+        "problem": problem_key,
+        "selected": meta,
+        "fingerprint": _fingerprint(),
+        "saved_at": datetime.utcnow().isoformat() + "Z",
+        "format": 2,
+    }
+    table[key] = record
     save_cache(table)
 
 
@@ -108,12 +120,10 @@ def bench_and_select(
     if verbose:
         print(f"[relay-bp-triton] Tuning {getattr(kernel, '__name__', 'kernel')} with {total} configs, reps={number}")
     for idx, cfg in enumerate(configs, start=1):
-        # tuned constexprs applied directly to the JIT kernel
         conf_kwargs = {k: v for k, v in cfg.items() if k.isupper()}
         num_warps = cfg.get("num_warps")
         num_stages = cfg.get("num_stages")
 
-        # JIT compile + warmups to avoid skewing timings
         kernel[grid](*args, **meta_base, **conf_kwargs, num_warps=num_warps, num_stages=num_stages)
         torch.cuda.synchronize()
         for _ in range(2):
@@ -138,5 +148,96 @@ def bench_and_select(
         best_str = ", ".join([f"{k}={v}" for k, v in best_cfg.items()])
         print(f"[relay-bp-triton] Selected: {best_str}")
     return best_cfg
+
+
+# ---- Dynamic config builders for bench path ----
+def _parse_list(env: str, default: list[int]) -> list[int]:
+    v = os.getenv(env)
+    if v is None:
+        return default
+    try:
+        return [int(x) for x in v.replace(" ", "").split(",") if x]
+    except Exception:
+        return default
+
+
+def _cap(n: int | None = None, env: str = "RELAY_TUNE_MAX_CFG", default: int = 64) -> int:
+    try:
+        return int(os.getenv(env, default if n is None else n))
+    except Exception:
+        return default if n is None else n
+
+
+def _sample(cfgs: list[triton.Config], env: str = "RELAY_TUNE_SAMPLE", default: int | None = None, seed: int = 0) -> list[triton.Config]:
+    k = os.getenv(env)
+    if k is None and default is None:
+        return cfgs
+    try:
+        kint = int(k if k is not None else default)
+    except Exception:
+        return cfgs
+    if kint and kint < len(cfgs):
+        rng = random.Random(int(os.getenv("RELAY_TUNE_SEED", seed)))
+        return rng.sample(cfgs, kint)
+    return cfgs
+
+
+def _make_configs(space: dict[str, list[int]], cap: int | None = None) -> list[triton.Config]:
+    keys = list(space.keys())
+    vals = [space[k] for k in keys]
+    out: list[triton.Config] = []
+    for combo in itertools.product(*vals):
+        kw = dict(zip(keys, combo))
+        bs = kw.get("BLOCK_SIZE", 0)
+        warps = kw.get("num_warps", 0)
+        if bs and (bs % 16 != 0):
+            continue
+        if warps and warps not in (2, 4, 8):
+            continue
+        out.append(triton.Config(kw, num_warps=kw.get("num_warps", 2), num_stages=kw.get("num_stages", 2)))
+    out = out[:_cap(cap)]
+    out = _sample(out)
+    return out
+
+
+def build_c2v_configs() -> list[triton.Config]:
+    bs  = _parse_list("RELAY_SWEEP_C2V_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128])
+    wp  = _parse_list("RELAY_SWEEP_C2V_WARPS",  [1, 2, 4, 8])
+    stg = _parse_list("RELAY_SWEEP_C2V_STAGES", [1, 2, 3])
+    space = {"BLOCK_SIZE": bs, "num_warps": wp, "num_stages": stg}
+    return _make_configs(space)
+
+
+def build_v2c_configs() -> list[triton.Config]:
+    bs  = _parse_list("RELAY_SWEEP_V2C_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128])
+    wp  = _parse_list("RELAY_SWEEP_V2C_WARPS",  [1, 2, 4, 8])
+    stg = _parse_list("RELAY_SWEEP_V2C_STAGES", [1, 2, 3])
+    space = {"BLOCK_SIZE": bs, "num_warps": wp, "num_stages": stg}
+    return _make_configs(space)
+
+
+def build_btile_compute_configs() -> list[triton.Config]:
+    bs  = _parse_list("RELAY_SWEEP_BT_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128])
+    wp  = _parse_list("RELAY_SWEEP_BT_WARPS",  [1, 2, 4, 8])
+    stg = _parse_list("RELAY_SWEEP_BT_STAGES", [1, 2, 3])
+    space = {"BLOCK_SIZE": bs, "num_warps": wp, "num_stages": stg}
+    return _make_configs(space)
+
+
+def build_btile_transpose_configs() -> list[triton.Config]:
+    btile = _parse_list("RELAY_SWEEP_TR_BTILE",  [8, 16, 32])
+    wp    = _parse_list("RELAY_SWEEP_TR_WARPS",  [1, 2, 4, 8])
+    stg   = _parse_list("RELAY_SWEEP_TR_STAGES", [1, 2, 3])
+    space = {"BTILE": btile, "num_warps": wp, "num_stages": stg}
+    return _make_configs(space)
+
+
+def build_parity_configs() -> list[triton.Config]:
+    bs  = _parse_list("RELAY_SWEEP_PAR_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128])
+    wp  = _parse_list("RELAY_SWEEP_PAR_WARPS",  [1, 2, 4, 8])
+    stg = _parse_list("RELAY_SWEEP_PAR_STAGES", [1, 2, 3])
+    space = {"BLOCK_SIZE": bs, "num_warps": wp, "num_stages": stg}
+    return _make_configs(space)
+
 
 

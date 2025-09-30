@@ -56,6 +56,8 @@ def parse_args():
     
     # Mode parameter
     parser.add_argument('--mode', choices=['relay','plain'], default='relay')
+    parser.add_argument('--perf', choices=['default','throughput','realtime'], default='default',
+                       help='Kernel execution path (default=row-wise)')
 
     # Circuit parameters
     parser.add_argument('--circuit', type=str, default='bicycle_bivariate_144_12_12_memory_choi_XZ',
@@ -111,12 +113,13 @@ def run_relay_bp_detailed(args):
         parallel=args.parallel,
         seed=args.seed,
         backend=args.backend,
+        perf=args.perf,
     )
 
 
 def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0, pre_iter, 
                            num_sets, set_max_iter, gamma_dist_min, gamma_dist_max, stop_nconv,
-                           target_errors=20, batch=2000, max_shots=1000000, parallel=True, seed=0, backend: str | None = None):
+                           target_errors=20, batch=2000, max_shots=1000000, parallel=True, seed=0, backend: str | None = None, perf: str = "default"):
     """Run Relay-BP experiment with detailed iteration counting - reusable function."""
     
     # Deterministic seeding using global seed
@@ -196,6 +199,8 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
         stop_nconv=stop_nconv,
         stopping_criterion="nconv",
         logging=False,
+        algo=("relay" if num_sets > 0 else "plain"),
+        perf=perf,
     )
     
     # Create observable decoder
@@ -218,6 +223,14 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     bp_iters_all = []
     
     sampler = dem.compile_sampler(seed=seed)
+    # Untimed warmup to avoid including JIT/tuning in timings
+    #try:
+    #    _det, _obs, _warm_errors = sampler.sample(batch, return_errors=True)
+    #    _ = observable_decoder.from_errors_decode_observables_detailed_batch(
+    #        _warm_errors.astype(np.uint8), parallel=parallel
+    #    )
+    #except Exception:
+    #    pass
     print(f"Collecting until {target_errors} errors or {max_shots} shots...")
 
     # Measure time around the actual error-targeted collection loop
@@ -376,11 +389,13 @@ def run_plain_bp_detailed(args):
         parallel=args.parallel,
         seed=args.seed,
         backend=args.backend,
+        perf=args.perf,
+        algo=args.algo,
     )
 
 def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
                             max_iter=200, alpha=None, target_errors=20, batch=2000,
-                            max_shots=1000000, parallel=True, seed=0, backend: str | None = None):
+                            max_shots=1000000, parallel=True, seed=0, backend: str | None = None, perf: str = "default", algo: str = "plain"):
     """Run plain min-sum BP (no relay, no memory) with detailed counting."""
 
     try:
@@ -442,7 +457,8 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
             gamma_dist_interval=(0.0, 0.0),
             stop_nconv=1,
             plain=True,
-            mode="default",
+            algo=algo,
+            perf=perf,
             alpha=(None if (alpha is None or alpha == 0.0) else float(alpha)),
             beta=None,
             device="cuda",
@@ -477,6 +493,14 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
     total_decode_shots = 0
 
     sampler = dem.compile_sampler(seed=seed)
+    # Untimed warmup to avoid including JIT/tuning in timings
+    #try:
+    #    _det, _obs, _warm_errors = sampler.sample(batch, return_errors=True)
+    #    _ = observable_decoder.from_errors_decode_observables_detailed_batch(
+    #        _warm_errors.astype(np.uint8), parallel=parallel
+    #    )
+    #except Exception:
+    #    pass
     print(f"Collecting until {target_errors} errors or {max_shots} shots...")
     start_time = time.time()
 
@@ -603,6 +627,7 @@ def main():
     print(f"  Error Rate: {args.error_rate}")
     print(f"  Basis: {args.basis}")
     print(f"  Mode: {args.mode}")
+    print(f"  Perf: {args.perf}")
     print(f"  Backend: {args.backend or 'rust'}")
     print()
 

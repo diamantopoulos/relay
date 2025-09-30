@@ -12,93 +12,7 @@
 
 import triton
 import triton.language as tl
-import itertools, os, random
-import torch
 from typing import Dict, Tuple, Optional
-
-
-# ---- Dynamic config builders for bench path ----
-def _parse_list(env: str, default: list[int]) -> list[int]:
-    v = os.getenv(env)
-    if v is None:
-        return default
-    try:
-        return [int(x) for x in v.replace(" ", "").split(",") if x]
-    except Exception:
-        return default
-
-def _cap(n: int | None = None, env: str = "RELAY_TUNE_MAX_CFG", default: int = 64) -> int:
-    try:
-        return int(os.getenv(env, default if n is None else n))
-    except Exception:
-        return default if n is None else n
-
-def _sample(cfgs: list[triton.Config], env: str = "RELAY_TUNE_SAMPLE", default: int | None = None, seed: int = 0) -> list[triton.Config]:
-    k = os.getenv(env)
-    if k is None and default is None:
-        return cfgs
-    try:
-        kint = int(k if k is not None else default)
-    except Exception:
-        return cfgs
-    if kint and kint < len(cfgs):
-        rng = random.Random(int(os.getenv("RELAY_TUNE_SEED", seed)))
-        return rng.sample(cfgs, kint)
-    return cfgs
-
-def _make_configs(space: dict[str, list[int]], cap: int | None = None) -> list[triton.Config]:
-    keys = list(space.keys())
-    vals = [space[k] for k in keys]
-    out: list[triton.Config] = []
-    for combo in itertools.product(*vals):
-        kw = dict(zip(keys, combo))
-        bs = kw.get("BLOCK_SIZE", 0)
-        warps = kw.get("num_warps", 0)
-        if bs and (bs % 16 != 0):
-            continue
-        if warps and warps not in (2, 4, 8):
-            continue
-        out.append(triton.Config(kw, num_warps=kw.get("num_warps", 2), num_stages=kw.get("num_stages", 2)))
-    out = out[:_cap(cap)]
-    out = _sample(out)
-    return out
-
-def build_c2v_configs() -> list[triton.Config]:
-    bs  = _parse_list("RELAY_SWEEP_C2V_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128])
-    wp  = _parse_list("RELAY_SWEEP_C2V_WARPS",  [2, 4, 8])
-    stg = _parse_list("RELAY_SWEEP_C2V_STAGES", [2])
-    space = {"BLOCK_SIZE": bs, "num_warps": wp, "num_stages": stg}
-    return _make_configs(space)
-
-def build_v2c_configs() -> list[triton.Config]:
-    bs  = _parse_list("RELAY_SWEEP_V2C_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128])
-    wp  = _parse_list("RELAY_SWEEP_V2C_WARPS",  [2, 4, 8])
-    stg = _parse_list("RELAY_SWEEP_V2C_STAGES", [1, 2])
-    space = {"BLOCK_SIZE": bs, "num_warps": wp, "num_stages": stg}
-    return _make_configs(space)
-
-def build_btile_configs() -> list[triton.Config]:
-    bs    = _parse_list("RELAY_SWEEP_BT_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128])
-    btile = _parse_list("RELAY_SWEEP_BT_BTILE",  [8, 16, 32])
-    wp    = _parse_list("RELAY_SWEEP_BT_WARPS",  [1, 2, 4, 8])
-    stg   = _parse_list("RELAY_SWEEP_BT_STAGES", [1, 2])
-    space = {"BLOCK_SIZE": bs, "BTILE": btile, "num_warps": wp, "num_stages": stg}
-    return _make_configs(space)
-
-def build_parity_configs() -> list[triton.Config]:
-    bs  = _parse_list("RELAY_SWEEP_PAR_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128])
-    wp  = _parse_list("RELAY_SWEEP_PAR_WARPS",  [1, 2, 4, 8])
-    stg = _parse_list("RELAY_SWEEP_PAR_STAGES", [1, 2])
-    space = {"BLOCK_SIZE": bs, "num_warps": wp, "num_stages": stg}
-    return _make_configs(space)
-
-def build_transpose_configs() -> list[triton.Config]:
-    """Build dynamic configs for transpose kernels (BTILE, num_warps, num_stages)."""
-    btile = _parse_list("RELAY_SWEEP_TR_BTILE",  [8, 16, 32])
-    wp    = _parse_list("RELAY_SWEEP_TR_WARPS",  [1, 2, 4, 8])
-    stg   = _parse_list("RELAY_SWEEP_TR_STAGES", [1, 2])
-    space = {"BTILE": btile, "num_warps": wp, "num_stages": stg}
-    return _make_configs(space)
 
 @triton.jit
 def c2v_min_sum_kernel(
@@ -648,8 +562,8 @@ def v2c_and_gamma_btile_kernel(
     lam_bj = tl.load(lam + bs * V + j, mask=mb_act, other=0.0)
     M_bj = lam_bj + sum_nu
     tl.store(M + bs * V + j, M_bj, mask=mb_act)
-    if WRITE_HARD:
-        tl.store(hard_dec + bs * V + j, (M_bj < 0.0).to(tl.uint8), mask=mb_act)
+    # Always update hard_dec (matches regular V2C kernel behavior)
+    tl.store(hard_dec + bs * V + j, (M_bj < 0.0).to(tl.uint8), mask=mb_act)
     g_bj = tl.load(gamma + bs * V + j, mask=mb_act, other=0.0)
     lam0_j = tl.load(lam0 + j)
     lam_new = (1.0 - g_bj) * lam0_j + g_bj * M_bj

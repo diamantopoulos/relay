@@ -19,7 +19,7 @@ from dataclasses import dataclass
 import triton
 
 from .graph import CSRGraph
-from . import auto_config as ac
+from . import autotune as ac
 from .kernels import (
     c2v_min_sum_kernel, v2c_and_marginals_fused_gamma_kernel,
     parity_per_check_kernel, init_messages_kernel, stop_flag_kernel,
@@ -33,7 +33,7 @@ from .utils import (
 )
 @dataclass
 class PerfCfg:
-    mode: str
+    perf: str
     msg_dtype: str
     check_every: int
     btile: int
@@ -79,7 +79,8 @@ class RelayBPDecoder:
         device: str = "cuda",
         seed: int = 1234,
         bitpack_output: bool = False,
-        mode: str = "default",  # "default" or "throughput"
+        algo: Optional[str] = None,           # "relay" or "plain"
+        perf: Optional[str] = None,           # "default" | "throughput" | "realtime"
         alpha_iteration_scaling_factor: Optional[float] = 1.0,
     ):
         """Initialize Relay-BP decoder.
@@ -129,7 +130,17 @@ class RelayBPDecoder:
         self.device = device
         self.seed = seed
         self.bitpack_output = bitpack_output
-        self.mode = mode
+        # Normalize separate axes
+        algo_norm = ((algo or ('plain' if (num_sets == 0) else 'relay'))).strip().lower()
+        if algo_norm not in ("relay", "plain"):
+            raise ValueError(f"Unknown algo '{algo_norm}'. Use 'relay' or 'plain'.")
+        self.algo = algo_norm
+
+        perf_norm = ((perf or 'default')).strip().lower()
+        perf_aliases = {"default":"default","row":"default","rowwise":"default","throughput":"throughput","btile":"throughput","realtime":"realtime"}
+        if perf_norm not in perf_aliases:
+            raise ValueError(f"Unknown perf '{perf_norm}'. Use 'default'/'throughput'/'realtime'.")
+        self.perf = perf_aliases[perf_norm]
         self.alpha_iteration_scaling_factor = float(alpha_iteration_scaling_factor or 1.0)
         
         # Set up device
@@ -166,7 +177,7 @@ class RelayBPDecoder:
         
         # Centralize perf config
         self.cfg = PerfCfg(
-            mode=self.mode,
+            perf=self.perf,
             msg_dtype=self.dtype_messages,
             check_every=int(os.getenv("RELAY_CHECK_EVERY", "1")),
             btile=int(os.getenv("RELAY_BTILE", "16")),
@@ -230,7 +241,7 @@ class RelayBPDecoder:
             # Device-driven early exit
             'stop_flag': torch.zeros(1, dtype=torch.uint8, device=self.device),
         }
-        if self.mode == "throughput":
+        if self.cfg.perf == "throughput":
             # [E,B] transposed message buffers for BTILE kernels
             tensors['muT'] = torch.zeros(self.E, B, dtype=self.msg_dtype, device=self.device)
             tensors['nuT'] = torch.zeros(self.E, B, dtype=self.msg_dtype, device=self.device)
@@ -290,7 +301,7 @@ class RelayBPDecoder:
         """Realtime single-sample decode using persistent worker.
         syndrome: [1, C] uint8 on CUDA device
         """
-        assert self.mode == "realtime", "Use mode='realtime' to call decode_rt()"
+        assert self.perf == "realtime", "Use perf='realtime' to call decode_rt()"
         if syndrome.device != torch.device(self.device):
             syndrome = syndrome.to(self.device)
         if syndrome.ndim == 1:
@@ -327,10 +338,10 @@ class RelayBPDecoder:
         problem_key = {"B": B, "E": self.E, "msg_is_fp16": msg_is_fp16}
         saved = ac.try_get_saved("be_to_eb_kernel", problem_key)
         if saved is None:
-            from .kernels import build_transpose_configs
+            from .autotune import build_btile_transpose_configs
             cfgs = [
                 dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages)
-                for c in build_transpose_configs()
+                for c in build_btile_transpose_configs()
             ]
             best = ac.bench_and_select(
                 kernel=be_to_eb_kernel,
@@ -362,10 +373,10 @@ class RelayBPDecoder:
         problem_key = {"B": B, "E": self.E, "msg_is_fp16": msg_is_fp16}
         saved = ac.try_get_saved("eb_to_be_kernel", problem_key)
         if saved is None:
-            from .kernels import build_transpose_configs
+            from .autotune import build_btile_transpose_configs
             cfgs = [
                 dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages)
-                for c in build_transpose_configs()
+                for c in build_btile_transpose_configs()
             ]
             best = ac.bench_and_select(
                 kernel=eb_to_be_kernel,
@@ -393,7 +404,8 @@ class RelayBPDecoder:
 
     def _launch_c2v_btile(self, tensors: Dict, B: int):
         grid = (self.C, (B + self.cfg.btile - 1) // self.cfg.btile)
-        alpha = self.normalized_min_sum_alpha or 0.0
+        # Use per-iteration alpha schedule (matches _launch_c2v_kernel behavior)
+        alpha = getattr(self, "_alpha_current", self.normalized_min_sum_alpha or 0.0)
         beta = self.offset_min_sum_beta or 0.0
         use_alpha = self.normalized_min_sum_alpha is not None
         use_beta = self.offset_min_sum_beta is not None
@@ -408,14 +420,19 @@ class RelayBPDecoder:
             alpha=alpha, beta=beta,
             use_alpha=use_alpha, use_beta=use_beta,
             msg_is_fp16=msg_is_fp16,
+            BTILE=int(self.cfg.btile),
         )
         saved = ac.try_get_saved("c2v_min_sum_btile_kernel", problem_key)
         if saved is None:
-            from .kernels import build_btile_configs
-            cfgs = [
-                dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages)
-                for c in build_btile_configs()
-            ]
+            from .autotune import build_btile_compute_configs
+            # Do NOT autotune BTILE here; keep BTILE fixed via self.cfg.btile.
+            # Strip any BTILE entries from candidate configs, only tune BLOCK_SIZE/warps/stages.
+            cfgs = []
+            for c in build_btile_compute_configs():
+                kw = dict(c.kwargs)
+                if 'BTILE' in kw:
+                    kw.pop('BTILE')
+                cfgs.append(dict(kw, num_warps=c.num_warps, num_stages=c.num_stages))
             best = ac.bench_and_select(
                 kernel=c2v_min_sum_btile_kernel,
                 grid=grid,
@@ -433,9 +450,8 @@ class RelayBPDecoder:
         if self._tune_log and "c2v_min_sum_btile_kernel" not in self._tune_logged:
             print(f"[relay-bp-triton] Using cached meta for c2v_min_sum_btile_kernel from {ac.DEFAULT_CACHE} key={problem_key}")
             self._tune_logged.add("c2v_min_sum_btile_kernel")
+        # Fixed BTILE is already in meta_base
         kw = {'BLOCK_SIZE': int(saved['BLOCK_SIZE'])}
-        if 'BTILE' in saved:
-            kw['BTILE'] = int(saved.get('BTILE', self.cfg.btile))
         c2v_min_sum_btile_kernel[grid](
             tensors['muT'], tensors['nuT'],
             self.graph.chk_ptr, self.graph.chk_edges,
@@ -465,7 +481,7 @@ class RelayBPDecoder:
 
         saved = ac.try_get_saved("c2v_min_sum_kernel", problem_key)
         if saved is None:
-            from .kernels import build_c2v_configs
+            from .autotune import build_c2v_configs
             cfgs = [
                 dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages)
                 for c in build_c2v_configs()
@@ -512,7 +528,7 @@ class RelayBPDecoder:
 
         saved = ac.try_get_saved("v2c_and_marginals_fused_gamma_kernel", problem_key)
         if saved is None:
-            from .kernels import build_v2c_configs
+            from .autotune import build_v2c_configs
             cfgs = [
                 dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages)
                 for c in build_v2c_configs()
@@ -562,7 +578,7 @@ class RelayBPDecoder:
 
         saved = ac.try_get_saved("parity_per_check_kernel", problem_key)
         if saved is None:
-            from .kernels import build_parity_configs
+            from .autotune import build_parity_configs
             cfgs = [
                 dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages)
                 for c in build_parity_configs()
@@ -618,14 +634,18 @@ class RelayBPDecoder:
         grid = (self.V, (B + self.cfg.btile - 1) // self.cfg.btile)
         msg_is_fp16 = (self.msg_dtype == torch.float16)
         problem_key = {"B": B, "V": self.V, "E": self.E, "msg_is_fp16": msg_is_fp16, "BTILE": self.cfg.btile, "WRITE_HARD": write_hard}
-        meta_base = dict(B=B, V=self.V, E=self.E, msg_is_fp16=msg_is_fp16, WRITE_HARD=write_hard)
+        meta_base = dict(B=B, V=self.V, E=self.E, msg_is_fp16=msg_is_fp16, WRITE_HARD=write_hard, BTILE=int(self.cfg.btile))
         saved = ac.try_get_saved("v2c_and_gamma_btile_kernel", problem_key)
         if saved is None:
-            from .kernels import build_btile_configs
-            cfgs = [
-                dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages)
-                for c in build_btile_configs()
-            ]
+            from .autotune import build_btile_compute_configs
+            # Do NOT autotune BTILE here; keep BTILE fixed via self.cfg.btile.
+            # Strip any BTILE entries from candidate configs, only tune BLOCK_SIZE/warps/stages.
+            cfgs = []
+            for c in build_btile_compute_configs():
+                kw = dict(c.kwargs)
+                if 'BTILE' in kw:
+                    kw.pop('BTILE')
+                cfgs.append(dict(kw, num_warps=c.num_warps, num_stages=c.num_stages))
             best = ac.bench_and_select(
                 kernel=v2c_and_gamma_btile_kernel,
                 grid=grid,
@@ -645,9 +665,8 @@ class RelayBPDecoder:
         if self._tune_log and "v2c_and_gamma_btile_kernel" not in self._tune_logged:
             print(f"[relay-bp-triton] Using cached meta for v2c_and_gamma_btile_kernel from {ac.DEFAULT_CACHE} key={problem_key}")
             self._tune_logged.add("v2c_and_gamma_btile_kernel")
+        # Fixed BTILE is already in meta_base
         kw = {'BLOCK_SIZE': int(saved['BLOCK_SIZE'])}
-        if 'BTILE' in saved:
-            kw['BTILE'] = int(saved.get('BTILE', self.cfg.btile))
         v2c_and_gamma_btile_kernel[grid](
             tensors['nuT'], tensors['muT'],
             self.graph.var_ptr, self.graph.var_edges,
@@ -743,7 +762,7 @@ class RelayBPDecoder:
         gamma0_tensor = sample_gamma_scalar(B, self.V, self.gamma0, self.device)
         tensors['gamma'][:] = gamma0_tensor
         
-        if self.cfg.mode == "throughput":
+        if self.cfg.perf == "throughput":
             # transpose mu/nu to [E,B] once
             self._be_to_eb(tensors['mu'], tensors['muT'], B)
             self._be_to_eb(tensors['nu'], tensors['nuT'], B)
@@ -761,7 +780,7 @@ class RelayBPDecoder:
                     self._alpha_current = 1.0
                 else:
                     self._alpha_current = a
-            if self.cfg.mode == "throughput":
+            if self.cfg.perf == "throughput":
                 # BTILE C2V and V2C fully in [E,B]
                 self._launch_c2v_btile(tensors, B)
                 self._launch_v2c_btile(tensors, B, write_hard=((t+1) % self.cfg.check_every == 0))
@@ -791,7 +810,7 @@ class RelayBPDecoder:
                     break
         
         # Final parity check after pre-iterations
-        if self.cfg.mode == "throughput":
+        if self.cfg.perf == "throughput":
             # Ensure hard_dec is fresh before parity
             self._launch_v2c_btile(tensors, B, write_hard=True)
         self._check_parity_and_select(tensors, B)
@@ -864,7 +883,7 @@ class RelayBPDecoder:
                         break
             
             # Final parity check after the leg
-            if self.cfg.mode == "throughput":
+            if self.cfg.perf == "throughput":
                 self._launch_v2c_btile(tensors, B, write_hard=True)
             self._check_parity_and_select(tensors, B)
             # Freeze/stop exactly like inside the loop (Rust-like), without bumping iter_counter
@@ -918,7 +937,8 @@ class RelayBPDecoder:
                 "stop_nconv": self.stop_nconv,
                 "dtype_messages": self.dtype_messages,
                 "device": self.device,
-                "mode": self.mode,
+                "algo": self.algo,
+                "perf": self.perf,
                 "check_every": self.cfg.check_every,
             },
         }

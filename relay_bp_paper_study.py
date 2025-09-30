@@ -28,7 +28,7 @@ class RelayBPPaperStudy:
     def _csv_fieldnames(self) -> list[str]:
         return [
             # Configuration parameters
-            'config_name', 'mode', 'backend',
+            'config_name', 'algo', 'perf', 'backend',
             'num_sets', 'stop_nconv', 'gamma0', 'gamma_dist_min', 'gamma_dist_max',
             'pre_iter', 'set_max_iter', 'circuit', 'distance', 'rounds', 'error_rate', 'basis',
             'max_iter',
@@ -42,7 +42,8 @@ class RelayBPPaperStudy:
     def _row_from_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
         return {
             'config_name': result.get('config_name', ''),
-            'mode': result.get('mode', ''),
+            'algo': result.get('algo', ''),
+            'perf': result.get('perf', ''),
             'backend': result.get('backend', ''),
             'num_sets': result.get('num_sets', ''),
             'stop_nconv': result.get('stop_nconv', ''),
@@ -90,160 +91,131 @@ class RelayBPPaperStudy:
             pass
 
     
-    def define_parameter_grid(self):
+    def define_configs(self) -> List[Dict[str, Any]]:
+        """Build a unified list of plain and relay configurations."""
+        configs: List[Dict[str, Any]] = []
         backends = ['rust', 'triton']
-        # Fix S (stop_nconv) and sweep R (num_sets) broadly per the paper
-        stop_nconv_values = [1, 2, 3, 5, 7, 9]
-        # Use an odd sweep for R to populate x-axis (adjust upper bound as needed)
-        num_sets_values = [1, 3, 5, 9, 13, 21, 45]
-        configs = []
-        for backend in backends:
-            for s in stop_nconv_values:
-                for r in num_sets_values:
-                    configs.append({
-                        'name': f'Relay-BP-S{s}-R{r}-{backend}',
-                        'mode': 'relay',
-                        'backend': backend,
-                        'num_sets': r,
-                        'gamma0': 0.125,
-                        'gamma_dist_interval': (-0.24, 0.66),
-                        'pre_iter': 80,
-                        'set_max_iter': 60,
-                        'stop_nconv': s,
-                    })
-        return configs
 
-    def define_plain_bp_grid(self):
-        # Sweep plain BP (no memory, no relay) by max_iter and backend to populate x-axis
+        # Plain BP sweep (no relay): vary max_iter per backend
         max_iter_values = [1, 5, 10, 20, 40, 60, 80, 100, 200, 300, 500, 600, 700, 1000, 1500, 2000, 5000, 10000]
-        backends = ['triton', 'rust']
-        configs = []
         for backend in backends:
             for tmax in max_iter_values:
                 configs.append({
                     'name': f'PlainBP-maxiter{tmax}-{backend}',
-                    'mode': 'plain',
+                    'algo': 'plain',
+                    'perf': 'throughput',
                     'backend': backend,
                     'max_iter': tmax,
                     'alpha': None,
                 })
+
+        # Relay-BP sweep: fixed S (stop_nconv) values and R (num_sets) grid
+        #stop_nconv_values = [1, 2, 3, 5, 7, 9]
+        #num_sets_values = [1, 3, 5, 9, 13, 21, 45]
+        #for backend in backends:
+        #    for s in stop_nconv_values:
+        #        for r in num_sets_values:
+        #            configs.append({
+        #                'name': f'Relay-BP-S{s}-R{r}-{backend}',
+        #                'algo': 'relay',
+        #                'perf': ('throughput' if backend == 'triton' else 'default'),
+        #                'backend': backend,
+        #                'num_sets': r,
+        #                'gamma0': 0.125,
+        #                'gamma_dist_interval': (-0.24, 0.66),
+        #                'pre_iter': 80,
+        #                'set_max_iter': 60,
+        #                'stop_nconv': s,
+        #            })
+
         return configs
 
-    def run_single_config(self, config: Dict[str, Any], shots: int = 1000) -> Dict[str, Any]:
-        """Run a single configuration using the detailed decoder."""
-        
+    def run_any_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
         print(f"Running {config['name']}...")
-        
+        algo = config.get('algo', 'relay')
+        perf = config.get('perf', 'default')
+        backend = config.get('backend', None)
         try:
-            # Run the Relay-BP experiment directly using the reusable function
-            output_data = run_relay_bp_experiment(
-                circuit='bicycle_bivariate_144_12_12_memory_choi_XZ',
-                basis='xz',
-                distance=12,
-                rounds=12,
-                error_rate=0.003,
-                gamma0=config['gamma0'],
-                pre_iter=config['pre_iter'],
-                num_sets=config['num_sets'],
-                set_max_iter=config['set_max_iter'],
-                gamma_dist_min=config['gamma_dist_interval'][0],
-                gamma_dist_max=config['gamma_dist_interval'][1],
-                stop_nconv=config['stop_nconv'],
-                target_errors=100,
-                batch=20000,
-                max_shots=1000000,
-                parallel=True,
-                backend=config.get('backend', None),
-            )
-            
-            # Add configuration info
-            output_data['config_name'] = config['name']
-            output_data['mode'] = 'relay'
-            output_data['backend'] = config.get('backend', '')
-            output_data['num_sets'] = config['num_sets']
-            output_data['stop_nconv'] = config['stop_nconv']
-            output_data['gamma0'] = config['gamma0']
-            output_data['gamma_dist_interval'] = config['gamma_dist_interval']
-            output_data['pre_iter'] = config['pre_iter']
-            output_data['set_max_iter'] = config['set_max_iter']
-            
-            
-            print(f"  LER: {output_data['logical_error_rate']:.2e}, Per-cycle LER: {output_data['per_cycle_logical_error_rate']:.2e}")
-            legs_suffix = f" (legs: {output_data['avg_legs']:.1f})" if 'avg_legs' in output_data else ""
-            print(f"  Avg BP iterations: {output_data['avg_bp_iterations']:.1f}{legs_suffix}")
-            
-            return output_data
-            
-        except Exception as e:
-            print(f"  Error: {e}")
-            return None
+            if algo == 'plain':
+                out = run_plain_bp_experiment(
+                    circuit='bicycle_bivariate_144_12_12_memory_choi_XZ',
+                    basis='xz',
+                    distance=12,
+                    rounds=12,
+                    error_rate=0.003,
+                    max_iter=config['max_iter'],
+                    alpha=config.get('alpha', None),
+                    # Configure study-local targets here (not via caller args)
+                    target_errors=20,
+                    batch=2048,
+                    max_shots=100_000,
+                    parallel=True,
+                    backend=backend,
+                    perf=perf,
+                )
+                out['algo'] = 'plain'
+                out['max_iter'] = config['max_iter']
+            else:
+                out = run_relay_bp_experiment(
+                    circuit='bicycle_bivariate_144_12_12_memory_choi_XZ',
+                    basis='xz',
+                    distance=12,
+                    rounds=12,
+                    error_rate=0.003,
+                    gamma0=config['gamma0'],
+                    pre_iter=config['pre_iter'],
+                    num_sets=config['num_sets'],
+                    set_max_iter=config['set_max_iter'],
+                    gamma_dist_min=config['gamma_dist_interval'][0],
+                    gamma_dist_max=config['gamma_dist_interval'][1],
+                    stop_nconv=config['stop_nconv'],
+                    target_errors=20,
+                    batch=2048,
+                    max_shots=100_000,
+                    parallel=True,
+                    backend=backend,
+                    perf=perf,
+                )
+                out['algo'] = 'relay'
+                out['num_sets'] = config['num_sets']
+                out['stop_nconv'] = config['stop_nconv']
+                out['gamma0'] = config['gamma0']
+                out['gamma_dist_interval'] = config['gamma_dist_interval']
+                out['pre_iter'] = config['pre_iter']
+                out['set_max_iter'] = config['set_max_iter']
 
-    def run_single_plain_bp_config(self, config: Dict[str, Any], shots: int = 1000) -> Dict[str, Any]:
-        print(f"Running {config['name']}...")
-        try:
-            output_data = run_plain_bp_experiment(
-                circuit='bicycle_bivariate_144_12_12_memory_choi_XZ',
-                basis='xz',
-                distance=12,
-                rounds=12,
-                error_rate=0.003,
-                max_iter=config['max_iter'],
-                alpha=config.get('alpha', None),
-                target_errors=10,
-                batch=2048,
-                max_shots=100_000,
-                parallel=True,
-                backend=config.get('backend', 'rust'),
-            )
-            output_data['config_name'] = config['name']
-            output_data['mode'] = 'plain'
-            output_data['backend'] = config.get('backend', '')
-            output_data['max_iter'] = config['max_iter']
-            print(f"  LER: {output_data['logical_error_rate']:.2e}, Per-cycle LER: {output_data['per_cycle_logical_error_rate']:.2e}")
-            print(f"  Avg BP iterations: {output_data['avg_bp_iterations']:.1f}")
-            return output_data
+            out['config_name'] = config['name']
+            out['backend'] = backend or ''
+            out['perf'] = perf
+            print(f"  LER: {out['logical_error_rate']:.2e}, Per-cycle LER: {out['per_cycle_logical_error_rate']:.2e}")
+            if 'avg_legs' in out:
+                print(f"  Avg BP iterations: {out['avg_bp_iterations']:.1f} (legs: {out['avg_legs']:.1f})")
+            else:
+                print(f"  Avg BP iterations: {out['avg_bp_iterations']:.1f}")
+            return out
         except Exception as e:
             print(f"  Error: {e}")
             return None
     
-    def run_study(self, shots: int = 1000):
-        """Run the complete study."""
+    def run_study(self):
+        """Run the complete study (targets configured inside run_any_config)."""
         
-        print("Starting Plain-BP Paper Study...")
+        print("Starting Paper Study (plain + relay)...")
         print("=" * 50)
         
-        configs = self.define_parameter_grid()
-        
-        # Run plain BP sweep (paper baseline)
-        bp_configs = self.define_plain_bp_grid()
-        for i, config in enumerate(bp_configs):
-            print(f"\n[Plain BP {i+1}/{len(bp_configs)}] {config['name']}")
-            result = self.run_single_plain_bp_config(config, shots)
+        # Build a combined configuration list (plain + relay), using algo/perf to discriminate
+        configs: List[Dict[str, Any]] = self.define_configs()
+
+        for i, config in enumerate(configs):
+            tag = config.get('algo', '')
+            print(f"\n[{i+1}/{len(configs)}] ({tag}) {config['name']}")
+            result = self.run_any_config(config)
             if result is not None:
                 self.results.append(result)
                 self.save_result_incremental(result)
-        
-        print(f"\nPlain BP study completed! Collected {len(self.results)} results.")
-
-#        print("Starting Relay-BP Paper Study...")
-
-#        for i, config in enumerate(configs):
-#            print(f"\n[{i+1}/{len(configs)}] {config['name']}")
-#            result = self.run_single_config(config, shots)
-#            if result is not None:
-#                self.results.append(result)
-#                self.save_result_incremental(result)
-        
-#        print(f"\n Relay BP study completed! Collected {len(self.results)} results.")
 
         # Save results
         self.save_results()
-        
-        # Print summary table
-        self.print_summary_table()
-        
-        # Create plots
-        self.plot_performance_curves()
     
     def save_results(self):
         """Save results to CSV."""
@@ -260,12 +232,6 @@ class RelayBPPaperStudy:
         
         print(f"Results saved to: {csv_path}")
     
-    def print_summary_table(self):
-        """Print a summary table of results."""
-        if not self.results:
-            print("No results to summarize")
-            return
-        
         print("\nSummary Table:")
         print("=" * 100)
         print(f"{'R (num_sets)':<12} {'S (stop_nconv)':<15} {'BP Iterations':<15} {'LER':<12} {'Per-cycle LER':<15}")
@@ -278,18 +244,11 @@ class RelayBPPaperStudy:
             pc_ler = result.get('per_cycle_logical_error_rate', 0.0)
             print(f"{str(r):<12} {str(s):<15} {avg_it:<15.1f} {ler:<12.2e} {pc_ler:<15.2e}")
     
-    def plot_performance_curves(self):
-        """Print performance data for manual plotting."""
-        
-        if not self.results:
-            print("No results to plot")
-            return
-
 
 def main():
     """Main function."""
     study = RelayBPPaperStudy()
-    study.run_study(shots=50)  # Start with fewer shots for faster testing
+    study.run_study()
 
 
 if __name__ == '__main__':

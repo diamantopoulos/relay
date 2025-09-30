@@ -25,11 +25,11 @@ class RelayDecoderF64:
                  set_max_iter, gamma_dist_interval=(-0.24, 0.66), stop_nconv=1,
                  stopping_criterion="nconv", logging=False, device: str = "cuda",
                  seed: Optional[int] = 0,
-                 plain: bool = False,
                  alpha: Optional[float] = None,
                  beta: Optional[float] = None,
                  dtype_messages: str = "fp32",
-                 mode: str = "default",
+                 algo: Optional[str] = None,
+                 perf: Optional[str] = None,
                  alpha_iteration_scaling_factor: float = 1.0,
                  bitpack_output: bool = False,
                  **kwargs):
@@ -44,7 +44,7 @@ class RelayDecoderF64:
             self.H_csr = _csr(H)
 
         self.N = int(self.H_csr.shape[1])
-        _plain = plain or (num_sets == 0)
+        _plain = (num_sets == 0)
         _gamma0 = 0.0 if _plain else gamma0
         _gamma_interval = (0.0, 0.0) if _plain else tuple(gamma_dist_interval)
         _alpha = alpha if (alpha is not None) else (None if _plain else 0.0)
@@ -65,7 +65,8 @@ class RelayDecoderF64:
             device=device,
             seed=int(seed or 0),
             bitpack_output=bitpack_output,
-            mode=mode,
+            algo=(algo or ("plain" if _plain else "relay")),
+            perf=perf,
             alpha_iteration_scaling_factor=alpha_iteration_scaling_factor,
         )
 
