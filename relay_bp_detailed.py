@@ -664,6 +664,7 @@ def main():
     print(f"  Mode: {args.mode}")
     print(f"  Perf: {args.perf}")
     print(f"  Backend: {args.backend or 'rust'}")
+    print(f"  Dtype: {args.dtype}")
     print()
 
     if args.mode == 'relay':
