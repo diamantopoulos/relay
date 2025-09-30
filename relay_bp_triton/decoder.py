@@ -22,7 +22,7 @@ from .graph import CSRGraph
 from . import autotune as ac
 from .kernels import (
     c2v_min_sum_kernel, v2c_and_marginals_fused_gamma_kernel,
-    parity_per_check_kernel, init_messages_kernel,
+    parity_per_check_kernel, parity_from_hard_kernel, init_messages_kernel,
     be_to_eb_kernel, eb_to_be_kernel, c2v_min_sum_btile_kernel, v2c_and_gamma_btile_kernel,
     relay_decode_persistent_kernel,
     reduce_all_ge_kernel, freeze_finished_lanes_kernel,
@@ -611,11 +611,13 @@ class RelayBPDecoder:
     
     def _launch_init_kernel(self, tensors: Dict, B: int):
         """Launch message initialization kernel."""
-        grid = (B * self.E,)
-        
+        N = B * self.E
+        BLOCK = 1024
+        grid = ((N + BLOCK - 1) // BLOCK,)
         init_messages_kernel[grid](
             tensors['mu'], tensors['nu'],
-            B, self.E
+            N,
+            BLOCK=BLOCK,
         )
     
     def _launch_v2c_btile(self, tensors: Dict, B: int, write_hard: bool):
@@ -773,7 +775,8 @@ class RelayBPDecoder:
             if self.cfg.perf == "throughput":
                 # BTILE C2V and V2C fully in [E,B]
                 self._launch_c2v_btile(tensors, B)
-                self._launch_v2c_btile(tensors, B, write_hard=((t+1) % self.cfg.check_every == 0))
+                on_cadence = ((t+1) % self.cfg.check_every == 0)
+                self._launch_v2c_btile(tensors, B, write_hard=on_cadence)
             else:
                 self._launch_c2v_kernel(tensors, B)
                 # Fused V2C + gamma mixing updates lambda_ internally
@@ -798,8 +801,47 @@ class RelayBPDecoder:
                     break
         
         # Final parity check after pre-iterations
-        # In throughput mode we no longer force hard_dec writes; parity reads from M
-        self._check_parity_and_select(tensors, B)
+        # In throughput mode, parity uses hard_dec snapshot; enable write and use the hard kernel
+        if self.cfg.perf == "throughput":
+            self._launch_v2c_btile(tensors, B, write_hard=True)
+            # Parity over hard_dec for lower bandwidth
+            total = B * self.C
+            grid = ((total + self.cfg.rows_per_chk - 1) // self.cfg.rows_per_chk,)
+            problem_key = {"B": B, "C": self.C, "V": self.V, "E": self.E, "ROWS_PER_CHK": self.cfg.rows_per_chk}
+            meta_base = dict(B=B, C=self.C, V=self.V, E=self.E, ROWS_PER_CHK=self.cfg.rows_per_chk)
+            saved = ac.try_get_saved("parity_from_hard_kernel", problem_key)
+            if saved is None:
+                from .autotune import build_parity_configs
+                cfgs = [
+                    dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages)
+                    for c in build_parity_configs()
+                ]
+                best = ac.bench_and_select(
+                    kernel=parity_from_hard_kernel,
+                    grid=grid,
+                    args=(
+                        tensors['hard_dec'],
+                        self.graph.chk_ptr, self.graph.chk_edges, self.graph.edge_var,
+                        tensors['syndrome'], tensors['check_ok'],
+                    ),
+                    meta_base=meta_base,
+                    configs=cfgs,
+                    number=20,
+                )
+                ac.set_saved("parity_from_hard_kernel", problem_key, best)
+                saved = best
+            parity_from_hard_kernel[grid](
+                tensors['hard_dec'],
+                self.graph.chk_ptr, self.graph.chk_edges, self.graph.edge_var,
+                tensors['syndrome'], tensors['check_ok'],
+                **meta_base,
+                BLOCK_SIZE=int(saved['BLOCK_SIZE']),
+                num_warps=int(saved.get('num_warps', 0)),
+                num_stages=int(saved.get('num_stages', 0)),
+            )
+        else:
+            # Default path (non-throughput): parity reads from M
+            self._check_parity_and_select(tensors, B)
         # Device-side freeze without bumping iter_counter
         freeze_finished_lanes_kernel[(B,)](
             tensors['best_errors'],

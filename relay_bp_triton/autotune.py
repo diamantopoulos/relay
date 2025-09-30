@@ -225,7 +225,7 @@ def build_btile_compute_configs() -> list[triton.Config]:
 
 
 def build_btile_transpose_configs() -> list[triton.Config]:
-    btile = _parse_list("RELAY_SWEEP_TR_BTILE",  [8, 16, 32])
+    btile = _parse_list("RELAY_SWEEP_TR_BTILE",  [8, 16, 32, 64, 128, 256])
     wp    = _parse_list("RELAY_SWEEP_TR_WARPS",  [1, 2, 4, 8])
     stg   = _parse_list("RELAY_SWEEP_TR_STAGES", [1, 2, 3])
     space = {"BTILE": btile, "num_warps": wp, "num_stages": stg}

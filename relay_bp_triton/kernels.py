@@ -44,6 +44,7 @@ def c2v_min_sum_kernel(
             row_start = tl.load(chk_ptr + i)
             row_end   = tl.load(chk_ptr + i + 1)
             deg = row_end - row_start
+            deg_is_one = deg == 1
             # If inactive, force deg=0 to skip work
             deg = tl.where(act_b == 0, 0, deg)
             if deg > 0:
@@ -109,7 +110,7 @@ def c2v_min_sum_kernel(
                     use_min2  = (cnt1 == 1) & is_argmin
                     out_mag   = tl.where(use_min2, min2, min1)
                     # Degree-1 checks must send zero.
-                    out_mag   = tl.where(deg == 1, 0.0, out_mag)
+                    out_mag   = tl.where(deg_is_one, 0.0, out_mag)
 
                     if use_alpha:
                         out_mag = alpha * out_mag
@@ -318,26 +319,56 @@ def parity_per_check_kernel(
 
 
 @triton.jit
+def parity_from_hard_kernel(
+    hard_dec,                # [B,V] uint8
+    chk_ptr, chk_edges,      # CSR over checks -> edge IDs
+    edge_var,                # [E] var index per edge
+    syndrome,                # [B,C] uint8
+    check_ok,                # [B,C] uint8 (out)
+    B, C, V, E,
+    BLOCK_SIZE: tl.constexpr,
+    ROWS_PER_CHK: tl.constexpr,  # Number of check rows to process per program
+):
+    """Parity check kernel loading bits from hard_dec (uint8)."""
+    pid = tl.program_id(axis=0)
+    base = pid * ROWS_PER_CHK
+    for r in tl.static_range(0, ROWS_PER_CHK):
+        idx = base + r
+        if idx < B * C:
+            b = idx // C
+            i = idx % C
+
+            row_start = tl.load(chk_ptr + i)
+            row_end   = tl.load(chk_ptr + i + 1)
+            par = tl.zeros((), dtype=tl.int32)
+
+            tile = row_start
+            while tile < row_end:
+                offs = tile + tl.arange(0, BLOCK_SIZE)
+                m    = offs < row_end
+                e    = tl.load(chk_edges + offs, mask=m, other=0)
+                v    = tl.load(edge_var + e,     mask=m, other=0)
+                bits = tl.load(hard_dec + b*V + v, mask=m, other=0).to(tl.int32) & 1
+                par  = par ^ (tl.sum(tl.where(m, bits, 0), axis=0) & 1)
+                tile += BLOCK_SIZE
+
+            syn = tl.load(syndrome + b*C + i).to(tl.int32) & 1
+            ok  = (par == syn).to(tl.uint8)
+            tl.store(check_ok + b*C + i, ok)
+
+@triton.jit
 def init_messages_kernel(
     mu, nu,
-    B, E
+    N,
+    BLOCK: tl.constexpr,
 ):
-    """Initialize messages to zero.
-    
-    Args:
-        mu: [B, E] variable-to-check messages
-        nu: [B, E] check-to-variable messages
-        B, E: batch size, num edges
-    """
+    """Vectorized zero initialization over flattened [B*E]."""
     pid = tl.program_id(axis=0)
-    b = pid // E
-    e = pid % E
-    
-    if b >= B or e >= E:
-        return
-    
-    tl.store(mu + b * E + e, 0.0)
-    tl.store(nu + b * E + e, 0.0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < N
+    z = tl.zeros((BLOCK,), dtype=tl.float32)
+    tl.store(mu + offs, z, mask=m)
+    tl.store(nu + offs, z, mask=m)
 
 
 @triton.jit
@@ -479,6 +510,7 @@ def c2v_min_sum_btile_kernel(
     deg = row_end - row_start
     if deg <= 0:
         return
+    deg_is_one = (deg == 1)
 
     # Accumulators per batch lane
     neg_parity = tl.zeros((BTILE,), dtype=tl.int32)
@@ -534,7 +566,7 @@ def c2v_min_sum_btile_kernel(
         use_min2 = (cnt1[None, :] == 1) & is_min1
         out_mag = tl.where(use_min2, min2[None, :], min1[None, :])
         # Degree-1 checks must send zero.
-        out_mag = tl.where((row_end - row_start) == 1, 0.0, out_mag)
+        out_mag = tl.where(deg_is_one, 0.0, out_mag)
         if use_alpha:
             out_mag = alpha * out_mag
         if use_beta:
