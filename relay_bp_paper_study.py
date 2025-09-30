@@ -28,7 +28,7 @@ class RelayBPPaperStudy:
     def _csv_fieldnames(self) -> list[str]:
         return [
             # Configuration parameters
-            'config_name', 'algo', 'perf', 'backend',
+            'config_name', 'algo', 'perf', 'backend', 'dtype',
             'num_sets', 'stop_nconv', 'gamma0', 'gamma_dist_min', 'gamma_dist_max',
             'pre_iter', 'set_max_iter', 'circuit', 'distance', 'rounds', 'error_rate', 'basis',
             'max_iter',
@@ -45,6 +45,7 @@ class RelayBPPaperStudy:
             'algo': result.get('algo', ''),
             'perf': result.get('perf', ''),
             'backend': result.get('backend', ''),
+            'dtype': result.get('dtype', ''),
             'num_sets': result.get('num_sets', ''),
             'stop_nconv': result.get('stop_nconv', ''),
             'gamma0': result.get('gamma0', ''),
@@ -99,15 +100,19 @@ class RelayBPPaperStudy:
         # Plain BP sweep (no relay): vary max_iter per backend
         max_iter_values = [1, 5, 10, 20, 40, 60, 80, 100, 200, 300, 500, 600, 700, 1000, 1500, 2000, 5000, 10000]
         for backend in backends:
-            for tmax in max_iter_values:
-                configs.append({
-                    'name': f'PlainBP-maxiter{tmax}-{backend}',
-                    'algo': 'plain',
-                    'perf': 'throughput',
-                    'backend': backend,
-                    'max_iter': tmax,
-                    'alpha': None,
-                })
+            # Supported dtype per backend
+            dtypes = ['fp16','fp32'] if backend == 'triton' else ['fp32','fp64']
+            for dtype in dtypes:
+                for tmax in max_iter_values:
+                    configs.append({
+                        'name': f'PlainBP-maxiter{tmax}-{backend}-{dtype}',
+                        'algo': 'plain',
+                        'perf': 'throughput',
+                        'backend': backend,
+                        'dtype': dtype,
+                        'max_iter': tmax,
+                        'alpha': None,
+                    })
 
         # Relay-BP sweep: fixed S (stop_nconv) values and R (num_sets) grid
         #stop_nconv_values = [1, 2, 3, 5, 7, 9]
@@ -135,6 +140,7 @@ class RelayBPPaperStudy:
         algo = config.get('algo', 'relay')
         perf = config.get('perf', 'default')
         backend = config.get('backend', None)
+        dtype = config.get('dtype', 'fp32')
         try:
             if algo == 'plain':
                 out = run_plain_bp_experiment(
@@ -152,6 +158,7 @@ class RelayBPPaperStudy:
                     parallel=True,
                     backend=backend,
                     perf=perf,
+                    dtype=dtype,
                 )
                 out['algo'] = 'plain'
                 out['max_iter'] = config['max_iter']
@@ -175,6 +182,7 @@ class RelayBPPaperStudy:
                     parallel=True,
                     backend=backend,
                     perf=perf,
+                    dtype=dtype,
                 )
                 out['algo'] = 'relay'
                 out['num_sets'] = config['num_sets']
@@ -187,6 +195,7 @@ class RelayBPPaperStudy:
             out['config_name'] = config['name']
             out['backend'] = backend or ''
             out['perf'] = perf
+            out['dtype'] = dtype
             print(f"  LER: {out['logical_error_rate']:.2e}, Per-cycle LER: {out['per_cycle_logical_error_rate']:.2e}")
             if 'avg_legs' in out:
                 print(f"  Avg BP iterations: {out['avg_bp_iterations']:.1f} (legs: {out['avg_legs']:.1f})")

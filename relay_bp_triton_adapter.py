@@ -20,7 +20,7 @@ class _ObsResult:
 
 # relay_bp_triton_adapter.py
 
-class RelayDecoderF64:
+class RelayDecoder:
     def __init__(self, check_matrix, *, error_priors, gamma0, pre_iter, num_sets,
                  set_max_iter, gamma_dist_interval=(-0.24, 0.66), stop_nconv=1,
                  stopping_criterion="nconv", logging=False, device: str = "cuda",
@@ -93,7 +93,7 @@ class RelayDecoderF64:
 
 
 class ObservableDecoderRunner:
-    def __init__(self, decoder: RelayDecoderF64, observables_matrix, include_decode_result: bool = True, **kwargs):
+    def __init__(self, decoder: RelayDecoder, observables_matrix, include_decode_result: bool = True, **kwargs):
         self.decoder = decoder
         if sp is not None and sp.issparse(observables_matrix):
             self._obs = observables_matrix.tocsr()

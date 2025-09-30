@@ -23,17 +23,39 @@ import hashlib
 import json
 
 
-def _select_backend(backend: str):
-    """Return (RelayDecoderF64, ObservableDecoderRunner, MinSumBPDecoderF64_or_None) for chosen backend."""
+def _select_backend(backend: str, dtype: str = 'fp32', require: str | None = None):
+    """Return dtype-aware decoder classes for the chosen backend.
+    For rust, returns (RelayDecoderXX, ObservableDecoderRunner, MinSumBPDecoderXX).
+    For triton, returns (RelayDecoderAdapter, ObservableDecoderRunner, None).
+    Errors if requested dtype class is unavailable (no silent fallback).
+    """
     if backend == "triton":
-        from relay_bp_triton_adapter import RelayDecoderF64 as _RelayDecoderF64
+        if dtype not in ("fp16", "fp32"):
+            raise ValueError("Triton supports only dtype in {'fp16','fp32'}")
+        from relay_bp_triton_adapter import RelayDecoder as _RelayDecoderAdapter
         from relay_bp_triton_adapter import ObservableDecoderRunner as _ObservableDecoderRunner
-        return _RelayDecoderF64, _ObservableDecoderRunner, None
-    # rust
-    from relay_bp import RelayDecoderF64 as _RelayDecoderF64
+        return _RelayDecoderAdapter, _ObservableDecoderRunner, None
+    # rust (dtype-selected, mode-specific requirement)
+    import relay_bp as _rb
+    if dtype not in ("fp32", "fp64"):
+        raise ValueError("Rust backend supports only dtype in {'fp32','fp64'} (no fp16 exports present)")
+    relay_cls = None
+    minsum_cls = None
+    # dtype suffix mapping to Rust class names
+    suffix_map = {"fp16": "F16", "fp32": "F32", "fp64": "F64"}
+    suff = suffix_map[dtype]
+    if require in (None, 'relay'):
+        relay_name = f"RelayDecoder{suff}"
+        if not hasattr(_rb, relay_name):
+            raise ValueError(f"Requested Rust relay decoder '{relay_name}' not available. Install a build with this dtype.")
+        relay_cls = getattr(_rb, relay_name)
+    if require in (None, 'plain'):
+        minsum_name = f"MinSumBPDecoder{suff}"
+        if not hasattr(_rb, minsum_name):
+            raise ValueError(f"Requested Rust plain decoder '{minsum_name}' not available. Install a build with this dtype.")
+        minsum_cls = getattr(_rb, minsum_name)
     from relay_bp import ObservableDecoderRunner as _ObservableDecoderRunner
-    from relay_bp import MinSumBPDecoderF64 as _MinSumBPDecoderF64
-    return _RelayDecoderF64, _ObservableDecoderRunner, _MinSumBPDecoderF64
+    return relay_cls, _ObservableDecoderRunner, minsum_cls
 
 
 def _format_time_units(ns: float) -> str:
@@ -58,6 +80,8 @@ def parse_args():
     parser.add_argument('--mode', choices=['relay','plain'], default='relay')
     parser.add_argument('--perf', choices=['default','throughput','realtime'], default='default',
                        help='Kernel execution path (default=row-wise)')
+    parser.add_argument('--dtype', choices=['fp16','fp32','fp64'], default='fp32',
+                       help='Numeric dtype: applies to Triton (fp16/fp32) and Rust (fp16/fp32/fp64 where available)')
 
     # Circuit parameters
     parser.add_argument('--circuit', type=str, default='bicycle_bivariate_144_12_12_memory_choi_XZ',
@@ -114,12 +138,14 @@ def run_relay_bp_detailed(args):
         seed=args.seed,
         backend=args.backend,
         perf=args.perf,
+        dtype=args.dtype,
     )
 
 
 def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0, pre_iter, 
                            num_sets, set_max_iter, gamma_dist_min, gamma_dist_max, stop_nconv,
-                           target_errors=20, batch=2000, max_shots=1000000, parallel=True, seed=0, backend: str | None = None, perf: str = "default"):
+                           target_errors=20, batch=2000, max_shots=1000000, parallel=True, seed=0,
+                           backend: str | None = None, perf: str = "default", dtype: str = 'fp32'):
     """Run Relay-BP experiment with detailed iteration counting - reusable function."""
     
     # Deterministic seeding using global seed
@@ -184,12 +210,9 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     }, sort_keys=True).encode()
     hasher.update(cfg_txt)
     
-    # Create Relay-BP decoder (CPU). Use normalized min-sum alpha if provided.
-    # Select backend adapters
-    _RelayDecoderF64, _ObservableDecoderRunner, _MinSumBPDecoderF64 = _select_backend(backend)
-
-    decoder = _RelayDecoderF64(
-        check_matrices.check_matrix,
+    # Create Relay-BP decoder via selector (dtype-aware)
+    _RelayDecoderDyn, _ObservableDecoderRunner, _ = _select_backend(backend, dtype, require='relay')
+    relay_common_kwargs = dict(
         error_priors=check_matrices.error_priors,
         gamma0=gamma0,
         pre_iter=pre_iter,
@@ -199,15 +222,25 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
         stop_nconv=stop_nconv,
         stopping_criterion="nconv",
         logging=False,
-        algo=("relay" if num_sets > 0 else "plain"),
-        perf=perf,
     )
-    
-    # Create observable decoder
+    # Triton adapter accepts dtype_messages; Rust classes do not
+    if backend == 'triton':
+        decoder = _RelayDecoderDyn(
+            check_matrices.check_matrix,
+            **relay_common_kwargs,
+            algo=("relay" if num_sets > 0 else "plain"),
+            perf=perf,
+            dtype_messages=('fp16' if dtype == 'fp16' else 'fp32'),
+        )
+    else:
+        decoder = _RelayDecoderDyn(
+            check_matrices.check_matrix,
+            **relay_common_kwargs,
+        )
     observable_decoder = _ObservableDecoderRunner(
         decoder,
         check_matrices.observables_matrix,
-        include_decode_result=True,  # Enable detailed results
+        include_decode_result=True,
     )
     
     # BP iteration stats (paper's x-axis) and debug legs reporting
@@ -390,11 +423,14 @@ def run_plain_bp_detailed(args):
         seed=args.seed,
         backend=args.backend,
         perf=args.perf,
+        dtype=args.dtype,
     )
 
 def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
                             max_iter=200, alpha=None, target_errors=20, batch=2000,
-                            max_shots=1000000, parallel=True, seed=0, backend: str | None = None, perf: str = "default", algo: str = "plain"):
+                            max_shots=1000000, parallel=True, seed=0,
+                            backend: str | None = None, perf: str = "default", algo: str = "plain",
+                            dtype: str = 'fp16'):
     """Run plain min-sum BP (no relay, no memory) with detailed counting."""
 
     try:
@@ -444,9 +480,9 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
 
     if backend == "triton":
         # Plain BP via Triton degeneracy
-        from relay_bp_triton_adapter import RelayDecoderF64 as _RelayDecoderF64
+        from relay_bp_triton_adapter import RelayDecoder as _RelayDecoderFXX
         from relay_bp_triton_adapter import ObservableDecoderRunner as _ObservableDecoderRunner
-        decoder = _RelayDecoderF64(
+        decoder = _RelayDecoderFXX(
             check_matrices.check_matrix,
             error_priors=check_matrices.error_priors,
             gamma0=0.0,
@@ -458,6 +494,7 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
             plain=True,
             algo=algo,
             perf=perf,
+            dtype_messages=('fp16' if dtype == 'fp16' else 'fp32'),
             alpha=(None if (alpha is None or alpha == 0.0) else float(alpha)),
             beta=None,
             device="cuda",
@@ -468,16 +505,15 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
             include_decode_result=True,
         )
     else:
-        # Rust native MinSum BP
-        kwargs = dict(
+        # Rust native MinSum BP (dtype-selected via selector; no fallback)
+        _RelayDecoderDyn_unused, _RustObservableRunner, _MinSumBPDecoderDyn = _select_backend("rust", dtype, require='plain')
+        decoder = _MinSumBPDecoderDyn(
+            check_matrices.check_matrix,
             error_priors=check_matrices.error_priors,
             max_iter=max_iter,
             alpha=None if (alpha == 0.0) else alpha,
             gamma0=None,
         )
-        _, _, _MinSumBPDecoderF64 = _select_backend("rust")
-        decoder = _MinSumBPDecoderF64(check_matrices.check_matrix, **kwargs)
-        from relay_bp import ObservableDecoderRunner as _RustObservableRunner
         observable_decoder = _RustObservableRunner(
             decoder,
             check_matrices.observables_matrix,

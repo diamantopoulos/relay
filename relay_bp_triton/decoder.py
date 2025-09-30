@@ -75,7 +75,7 @@ class RelayBPDecoder:
         stop_nconv: int = 5,
         normalized_min_sum_alpha: Optional[float] = 0.90,
         offset_min_sum_beta: Optional[float] = None,
-        dtype_messages: str = "fp16",  # Default to fp16 for better performance
+        dtype_messages: str = "fp16",
         device: str = "cuda",
         seed: int = 1234,
         bitpack_output: bool = False,
@@ -475,8 +475,8 @@ class RelayBPDecoder:
 
         msg_is_fp16 = (self.msg_dtype == torch.float16)
         rows = self.cfg.rows_per_chk
-        problem_key = {"B": B, "C": self.C, "E": self.E, "msg_is_fp16": msg_is_fp16, "ROWS_PER_PROG": rows}
-        meta_base = dict(B=B, C=self.C, E=self.E, msg_is_fp16=msg_is_fp16, ROWS_PER_PROG=rows,
+        problem_key = {"B": B, "C": self.C, "E": self.E, "msg_is_fp16": msg_is_fp16, "ROWS_PER_CHK": rows}
+        meta_base = dict(B=B, C=self.C, E=self.E, msg_is_fp16=msg_is_fp16, ROWS_PER_CHK=rows,
                          alpha=alpha, beta=beta, use_alpha=use_alpha, use_beta=use_beta)
 
         saved = ac.try_get_saved("c2v_min_sum_kernel", problem_key)
@@ -523,8 +523,8 @@ class RelayBPDecoder:
         grid = ((total + self.cfg.rows_per_var - 1) // self.cfg.rows_per_var,)
         msg_is_fp16 = (self.msg_dtype == torch.float16)
         rows = self.cfg.rows_per_var
-        problem_key = {"B": B, "V": self.V, "E": self.E, "msg_is_fp16": msg_is_fp16, "ROWS_PER_PROG": rows, "STORE_M": True}
-        meta_base = dict(B=B, V=self.V, E=self.E, msg_is_fp16=msg_is_fp16, ROWS_PER_PROG=rows, STORE_M=True)
+        problem_key = {"B": B, "V": self.V, "E": self.E, "msg_is_fp16": msg_is_fp16, "ROWS_PER_VAR": rows, "STORE_M": True}
+        meta_base = dict(B=B, V=self.V, E=self.E, msg_is_fp16=msg_is_fp16, ROWS_PER_VAR=rows, STORE_M=True)
 
         saved = ac.try_get_saved("v2c_and_marginals_fused_gamma_kernel", problem_key)
         if saved is None:
@@ -573,8 +573,8 @@ class RelayBPDecoder:
         total = B * self.C
         grid = ((total + self.cfg.rows_per_chk - 1) // self.cfg.rows_per_chk,)
 
-        problem_key = {"B": B, "C": self.C, "V": self.V, "E": self.E, "ROWS_PER_PROG": self.cfg.rows_per_chk}
-        meta_base = dict(B=B, C=self.C, V=self.V, E=self.E, ROWS_PER_PROG=self.cfg.rows_per_chk)
+        problem_key = {"B": B, "C": self.C, "V": self.V, "E": self.E, "ROWS_PER_CHK": self.cfg.rows_per_chk}
+        meta_base = dict(B=B, C=self.C, V=self.V, E=self.E, ROWS_PER_CHK=self.cfg.rows_per_chk)
 
         saved = ac.try_get_saved("parity_per_check_kernel", problem_key)
         if saved is None:

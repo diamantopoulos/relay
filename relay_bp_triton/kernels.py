@@ -25,14 +25,14 @@ def c2v_min_sum_kernel(
     use_alpha: tl.constexpr, use_beta: tl.constexpr,
     msg_is_fp16: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    ROWS_PER_PROG: tl.constexpr,  # Number of rows to process per program
+    ROWS_PER_CHK: tl.constexpr,  # Number of check rows to process per program
 ):
     """Check-to-variable min-sum kernel with proper two-pass implementation (batched)."""
     pid = tl.program_id(axis=0)
-    base = pid * ROWS_PER_PROG
+    base = pid * ROWS_PER_CHK
     
-    # Process up to ROWS_PER_PROG {b,i} pairs
-    for r in tl.static_range(0, ROWS_PER_PROG):
+    # Process up to ROWS_PER_CHK {b,i} pairs
+    for r in tl.static_range(0, ROWS_PER_CHK):
         idx = base + r
         # Only process if within bounds
         if idx < B * C:
@@ -145,14 +145,14 @@ def v2c_and_marginals_fused_gamma_kernel(
     msg_is_fp16: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     STORE_M: tl.constexpr,  # Whether to store M (for bandwidth optimization)
-    ROWS_PER_PROG: tl.constexpr,  # Number of rows to process per program
+    ROWS_PER_VAR: tl.constexpr,  # Number of variable rows to process per program
 ):
     """Variable-to-check and marginals kernel with fused gamma mixing (batched)."""
     pid = tl.program_id(axis=0)
-    base = pid * ROWS_PER_PROG
+    base = pid * ROWS_PER_VAR
     
-    # Process up to ROWS_PER_PROG {b,j} pairs
-    for r in tl.static_range(0, ROWS_PER_PROG):
+    # Process up to ROWS_PER_VAR {b,j} pairs
+    for r in tl.static_range(0, ROWS_PER_VAR):
         idx = base + r
         # Only process if within bounds
         if idx < B * V:
@@ -213,13 +213,13 @@ def v2c_and_marginals_mu_damped_kernel(
     B, V, E,
     msg_is_fp16: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    ROWS_PER_PROG: tl.constexpr,
+    ROWS_PER_VAR: tl.constexpr,
 ):
     """Variable node update with μ damping; λ is not modified here."""
     pid = tl.program_id(axis=0)
-    base = pid * ROWS_PER_PROG
+    base = pid * ROWS_PER_VAR
 
-    for r in tl.static_range(0, ROWS_PER_PROG):
+    for r in tl.static_range(0, ROWS_PER_VAR):
         idx = base + r
         if idx < B * V:
             b = idx // V
@@ -283,14 +283,14 @@ def parity_per_check_kernel(
     check_ok,                # [B,C] uint8 (out)
     B, C, V, E,
     BLOCK_SIZE: tl.constexpr,
-    ROWS_PER_PROG: tl.constexpr,  # Number of rows to process per program
+    ROWS_PER_CHK: tl.constexpr,  # Number of check rows to process per program
 ):
     """Parity check kernel with proper tiling over all neighbors (batched)."""
     pid = tl.program_id(axis=0)
-    base = pid * ROWS_PER_PROG
+    base = pid * ROWS_PER_CHK
     
-    # Process up to ROWS_PER_PROG {b,i} pairs
-    for r in tl.static_range(0, ROWS_PER_PROG):
+    # Process up to ROWS_PER_CHK {b,i} pairs
+    for r in tl.static_range(0, ROWS_PER_CHK):
         idx = base + r
         # Only process if within bounds
         if idx < B * C:
