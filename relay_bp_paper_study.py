@@ -157,7 +157,7 @@ class RelayBPPaperStudy:
                     # Configure study-local targets here (not via caller args)
                     target_errors=20,
                     batch=config.get('batch', 2048),
-                    max_shots=100_000,
+                    max_shots=1,
                     parallel=True,
                     backend=backend,
                     perf=perf,
