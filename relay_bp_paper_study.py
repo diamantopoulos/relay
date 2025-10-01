@@ -31,7 +31,6 @@ class RelayBPPaperStudy:
             'config_name', 'algo', 'perf', 'backend', 'dtype', 'batch',
             'num_sets', 'stop_nconv', 'gamma0', 'gamma_dist_min', 'gamma_dist_max',
             'pre_iter', 'set_max_iter', 'circuit', 'distance', 'rounds', 'error_rate', 'basis',
-            'max_iter',
             # Experiment results
             'shots', 'logical_errors', 'logical_error_rate', 'per_cycle_logical_error_rate',
             'per_round_per_qubit_rate', 'avg_bp_iterations', 'avg_legs',
@@ -59,7 +58,6 @@ class RelayBPPaperStudy:
             'rounds': result.get('config', {}).get('rounds', ''),
             'error_rate': result.get('config', {}).get('error_rate', ''),
             'basis': 'xz',
-            'max_iter': result.get('config', {}).get('max_iter', ''),
             'shots': result.get('shots', ''),
             'logical_errors': result.get('logical_errors', ''),
             'logical_error_rate': result.get('logical_error_rate', ''),
@@ -97,15 +95,16 @@ class RelayBPPaperStudy:
         """Build a unified list of plain and relay configurations."""
         configs: List[Dict[str, Any]] = []
         backends = ['rust', 'triton']
-        batch_values = [32, 64, 128,256, 512, 1024, 2048, 4096]
+        #batch_values = [32, 64, 128, 256, 512, 1024, 2048, 4096]
+        batch_values = [1]
 
-        # Plain BP sweep (no relay): vary max_iter per backend
-        max_iter_values = [1, 5, 10, 20, 40, 60, 80, 100, 200, 300, 500, 600, 700, 1000, 1500, 2000, 5000, 10000]
+        # Plain BP sweep (no relay): vary set_max_iter per backend
+        set_max_iter_values = [1, 5, 10, 20, 40, 60, 80, 100, 200, 300, 500, 600, 700, 1000, 1500, 2000, 5000, 10000]
         for backend in backends:
             # Supported dtype per backend
             dtypes = ['fp32'] #['fp16','fp32'] if backend == 'triton' else ['fp32','fp64']
             for dtype in dtypes:
-                for tmax in max_iter_values:
+                for tmax in set_max_iter_values:
                     for batch in batch_values:
                         configs.append({
                             'name': f'PlainBP-maxiter{tmax}-B{batch}-{backend}-{dtype}',
@@ -114,7 +113,7 @@ class RelayBPPaperStudy:
                             'backend': backend,
                             'dtype': dtype,
                             'batch': batch,
-                            'max_iter': tmax,
+                            'set_max_iter': tmax,
                             'alpha': None,
                         })
 
@@ -153,7 +152,7 @@ class RelayBPPaperStudy:
                     distance=12,
                     rounds=12,
                     error_rate=0.003,
-                    max_iter=config['max_iter'],
+                    set_max_iter=config['set_max_iter'],
                     alpha=config.get('alpha', None),
                     # Configure study-local targets here (not via caller args)
                     target_errors=20,
@@ -165,7 +164,7 @@ class RelayBPPaperStudy:
                     dtype=dtype,
                 )
                 out['algo'] = 'plain'
-                out['max_iter'] = config['max_iter']
+                out['set_max_iter'] = config['set_max_iter']
             else:
                 out = run_relay_bp_experiment(
                     circuit='bicycle_bivariate_144_12_12_memory_choi_XZ',

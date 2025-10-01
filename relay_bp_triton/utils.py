@@ -10,10 +10,12 @@
 
 """Utility functions for Relay-BP-S decoding."""
 
+from __future__ import annotations
 import torch
 import numpy as np
-from typing import Tuple, Optional
-
+from typing import Any, Dict, Optional, Tuple
+from scipy.sparse import csc_matrix, csr_matrix, coo_matrix
+from scipy.sparse.csgraph import connected_components
 
 def bitpack_errors(errors: torch.Tensor, bits_per_word: int = 32) -> torch.Tensor:
     """Pack error bits into words for memory efficiency.
@@ -243,3 +245,193 @@ def format_memory_size(bytes: int) -> str:
             return f"{bytes:.1f} {unit}"
         bytes /= 1024.0
     return f"{bytes:.1f} PB"
+
+
+
+def _deg_stats(arr: np.ndarray) -> Tuple[int, float, int]:
+    if arr.size == 0:
+        return 0, 0.0, 0
+    return int(arr.min()), float(arr.mean()), int(arr.max())
+
+def _hist_small_ints(deg: np.ndarray, bins=(2,3,4,5,6,8,12,16,24,32)) -> Dict[str,int]:
+    if deg.size == 0:
+        return {}
+    out = {}
+    prev = 0
+    for b in bins:
+        out[f"≤{b}"] = int((deg <= b).sum() - prev)
+        prev = (deg <= b).sum()
+    out[f">{bins[-1]}"] = int((deg > bins[-1]).sum())
+    return out
+
+def _rank_gf2_via_reduction(H_csr: csr_matrix) -> int:
+    """
+    Compute rank over GF(2) via sparse row-reduction.
+    WARNING: potentially expensive for very large matrices; enable only if you need it.
+    """
+    # convert to COO for simple row-ops, then to dense bit rows per pivot band
+    H = H_csr.copy().astype(np.uint8)
+    M, N = H.shape
+    pivcol = 0
+    rank = 0
+    indptr, indices = H.indptr, H.indices
+    # Build list of sets for quick XOR row ops
+    rows = [set(indices[indptr[i]:indptr[i+1]]) for i in range(M)]
+    while pivcol < N and rank < M:
+        # find a row with a 1 in pivcol at or below 'rank'
+        pivot = -1
+        for r in range(rank, M):
+            if pivcol in rows[r]:
+                pivot = r
+                break
+        if pivot == -1:
+            pivcol += 1
+            continue
+        # swap rows (as sets)
+        if pivot != rank:
+            rows[rank], rows[pivot] = rows[pivot], rows[rank]
+        # eliminate below
+        for r in range(rank+1, M):
+            if pivcol in rows[r]:
+                rows[r] ^= rows[rank]  # symmetric diff = XOR over GF(2)
+        rank += 1
+        pivcol += 1
+    return rank
+
+def describe_check_matrices(
+    check_matrices,
+    *,
+    dem: Optional[Any] = None,        # expects .num_detectors / .num_observables if given
+    rounds: Optional[int] = None,
+    compute_components: bool = False, # compute connected components of Tanner graph
+    compute_rank: bool = False,       # GF(2) rank of H (can be expensive)
+    file=None,
+    return_dict: bool = False,
+) -> Dict[str, Any]:
+    """
+    Derive & print detailed stats from real matrices only (no name heuristics).
+    """
+    H = check_matrices.check_matrix       # usually CSC
+    O = check_matrices.observables_matrix # usually CSC
+    pri = np.asarray(check_matrices.error_priors)
+
+    # Ensure both CSR and CSC forms
+    H_csr: csr_matrix = H if isinstance(H, csr_matrix) else H.tocsr(copy=False)
+    H_csc: csc_matrix = H if isinstance(H, csc_matrix) else H.tocsc(copy=False)
+
+    M, N = H_csr.shape
+    E = int(H_csr.nnz)
+    density = (E / (M * N)) if (M and N) else 0.0
+
+    # Tanner degrees
+    row_deg = np.diff(H_csr.indptr)       # errors per check
+    col_deg = np.diff(H_csc.indptr)       # checks per error
+    rmin, rmean, rmax = _deg_stats(row_deg)
+    cmin, cmean, cmax = _deg_stats(col_deg)
+    is_row_reg = (rmin == rmax and M > 0)
+    is_col_reg = (cmin == cmax and N > 0)
+    regularity = (
+        f"(d_v={cmin}, d_c={rmin})-regular" if (is_row_reg and is_col_reg)
+        else ("row-regular" if is_row_reg else ("column-regular" if is_col_reg else None))
+    )
+    col_hist = _hist_small_ints(col_deg)
+    row_hist = _hist_small_ints(row_deg)
+
+    # Observables matrix stats
+    O_rows, O_cols = O.shape
+    O_nnz = int(O.nnz)
+    O_density = (O_nnz / (O_rows * O_cols)) if (O_rows and O_cols) else 0.0
+
+    # Priors
+    finite_mask = np.isfinite(pri)
+    pri_stats = {
+        "length": int(pri.size),
+        "finite_fraction": float(finite_mask.mean() if pri.size else 1.0),
+        "min": float(np.min(pri[finite_mask])) if finite_mask.any() else float("nan"),
+        "mean": float(np.mean(pri[finite_mask])) if finite_mask.any() else float("nan"),
+        "max": float(np.max(pri[finite_mask])) if finite_mask.any() else float("nan"),
+    }
+
+    # Per-cycle detectors from DEM if provided
+    dets_total = getattr(dem, "num_detectors", None) if dem is not None else None
+    per_cycle_detectors = (dets_total // rounds) if (dets_total is not None and rounds) else None
+
+    # Optional: connected components of Tanner graph (bipartite graph with M+N nodes)
+    comp_info = None
+    if compute_components and E > 0:
+        # build bipartite adjacency: blocks [0:M) checks, [M:M+N) variables
+        H_coo: coo_matrix = H_csr.tocoo(copy=False)
+        rows = H_coo.row
+        cols = H_coo.col + M
+        data = np.ones_like(rows, dtype=np.uint8)
+        # symmetric adjacency
+        i_idx = np.concatenate([rows, cols])
+        j_idx = np.concatenate([cols, rows])
+        A = coo_matrix((np.ones_like(i_idx, dtype=np.uint8), (i_idx, j_idx)), shape=(M+N, M+N)).tocsr()
+        n_comp, labels = connected_components(A, directed=False, return_labels=True)
+        comp_sizes = np.bincount(labels)
+        comp_info = {
+            "num_components": int(n_comp),
+            "component_sizes_desc": np.sort(comp_sizes)[::-1].tolist(),
+        }
+
+    # Optional: GF(2) rank and k ≈ N - rank(H)
+    rank_info = None
+    if compute_rank and E > 0:
+        rank_h = _rank_gf2_via_reduction(H_csr.astype(np.uint8))
+        k_est = int(N - rank_h)
+        rank_info = {"rank_gf2": int(rank_h), "k_estimate": k_est}
+
+    # ----- printing -----
+    pf = print if file is None else (lambda *a, **k: print(*a, **k, file=file))
+
+    pf(f"H (checks × errors): {M} × {N}")
+    pf(f"  nonzeros (E): {E} | density: {density:.9f}")
+    pf(f"  avg column weight (checks per error): {cmean:.2f}")
+    pf(f"  avg row    weight (errors per check): {rmean:.2f}")
+    pf(f"  column weight min/mean/max: {cmin} / {cmean:.2f} / {cmax}")
+    pf(f"  row    weight min/mean/max: {rmin} / {rmean:.2f} / {rmax}")
+    if regularity:
+        pf(f"  regularity: {regularity}")
+    pf(f"  column weight hist: {col_hist}")
+    pf(f"  row    weight hist: {row_hist}")
+
+    pf(f"O (observables × errors): {O_rows} × {O_cols} (nnz={O_nnz}, density={O_density:.9f})")
+
+    if rounds is not None:
+        if per_cycle_detectors is not None:
+            pf(f"per-cycle detectors: {per_cycle_detectors}  (from DEM: {dets_total} / rounds: {rounds})")
+        else:
+            pf(f"per-cycle detectors: unavailable (need DEM with num_detectors)")
+
+    if rank_info:
+        pf(f"rank_GF2(H) = {rank_info['rank_gf2']}  =>  k_est ≈ {rank_info['k_estimate']}")
+
+    if comp_info:
+        pf(f"Tanner graph connected components: {comp_info['num_components']} "
+           f"(largest sizes: {comp_info['component_sizes_desc'][:5]})")
+
+    pf(f"priors: N={pri_stats['length']}, finite={pri_stats['finite_fraction']*100:.1f}% | "
+       f"min/mean/max={pri_stats['min']}/{pri_stats['mean']}/{pri_stats['max']}")
+
+    out = {
+        "H": {
+            "shape": (M, N),
+            "nonzeros": E,
+            "density": density,
+            "avg_column_weight": cmean,
+            "avg_row_weight": rmean,
+            "column_weight_stats": {"min": cmin, "mean": cmean, "max": cmax},
+            "row_weight_stats": {"min": rmin, "mean": rmean, "max": rmax},
+            "column_weight_hist": col_hist,
+            "row_weight_hist": row_hist,
+            "regularity": regularity,
+        },
+        "O": {"shape": (O_rows, O_cols), "nonzeros": O_nnz, "density": O_density},
+        "priors": pri_stats,
+        "rounds": rounds,
+        "per_cycle_detectors": per_cycle_detectors,
+        "rank": rank_info,
+        "components": comp_info,
+    }
+    return out if return_dict else out

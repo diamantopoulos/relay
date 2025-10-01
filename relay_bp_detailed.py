@@ -21,7 +21,7 @@ import relay_bp
 from relay_bp.stim.sinter.check_matrices import CheckMatrices
 import hashlib
 import json
-
+from relay_bp_triton.utils import describe_check_matrices
 
 def _select_backend(backend: str, dtype: str = 'fp32', require: str | None = None):
     """Return dtype-aware decoder classes for the chosen backend.
@@ -415,7 +415,7 @@ def run_plain_bp_detailed(args):
         distance=args.distance,
         rounds=args.rounds,
         error_rate=args.error_rate,
-        max_iter=args.set_max_iter,
+        set_max_iter=args.set_max_iter,
         alpha=args.alpha,
         target_errors=args.target_errors,
         batch=args.batch,
@@ -428,7 +428,7 @@ def run_plain_bp_detailed(args):
     )
 
 def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
-                            max_iter=200, alpha=None, target_errors=20, batch=2000,
+                            set_max_iter=200, alpha=None, target_errors=20, batch=2000,
                             max_shots=1000000, parallel=True, seed=0,
                             backend: str | None = None, perf: str = "default", algo: str = "plain",
                             dtype: str = 'fp16'):
@@ -461,6 +461,16 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
     assert dem.num_observables > 0
 
     check_matrices = CheckMatrices.from_dem(dem)
+    stats = describe_check_matrices(
+        check_matrices,
+        dem=dem,
+        rounds=rounds,
+        compute_components=True,  # set True if you want components (may be slow for huge H)
+        compute_rank=True,        # set True if you can afford GF(2) rank
+        return_dict=True,
+    )
+
+
     # Initialize determinism hasher (32-byte BLAKE2b)
     hasher = hashlib.blake2b(digest_size=32)
     # Problem spec: H, observables, priors
@@ -474,7 +484,7 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
     # Config + seeds
     cfg_txt = json.dumps({
         "circuit": circuit, "basis": basis, "distance": distance, "rounds": rounds,
-        "error_rate": error_rate, "max_iter": max_iter, "alpha": alpha,
+        "error_rate": error_rate, "set_max_iter": set_max_iter, "alpha": alpha,
         "parallel": bool(parallel), "stim_seed": seed
     }, sort_keys=True).encode()
     hasher.update(cfg_txt)
@@ -487,7 +497,7 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
             check_matrices.check_matrix,
             error_priors=check_matrices.error_priors,
             gamma0=0.0,
-            pre_iter=max_iter,
+            pre_iter=set_max_iter,
             num_sets=0,
             set_max_iter=0,
             gamma_dist_interval=(0.0, 0.0),
@@ -511,7 +521,7 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
         decoder = _MinSumBPDecoderDyn(
             check_matrices.check_matrix,
             error_priors=check_matrices.error_priors,
-            max_iter=max_iter,
+            max_iter=set_max_iter,
             alpha=None if (alpha == 0.0) else alpha,
             gamma0=None,
         )
@@ -626,7 +636,7 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
             'distance': int(distance),
             'rounds': int(rounds),
             'error_rate': float(error_rate),
-            'max_iter': int(max_iter),
+            'set_max_iter': int(set_max_iter),
             'alpha': None if alpha is None else float(alpha),
             'batch': int(batch),
         }
@@ -682,7 +692,7 @@ def main():
     else:
         # Plain-BP parameters
         print("Plain-BP Parameters:")
-        print(f"  Max Iterations: {args.set_max_iter}")
+        print(f"  Set Max Iterations: {args.set_max_iter}")
         print(f"  Alpha (normalized min-sum): {args.alpha}")
         print()
     
