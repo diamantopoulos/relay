@@ -13,6 +13,7 @@
 from __future__ import annotations
 import torch
 import numpy as np
+import time
 from typing import Any, Dict, Optional, Tuple
 from scipy.sparse import csc_matrix, csr_matrix, coo_matrix
 from scipy.sparse.csgraph import connected_components
@@ -435,3 +436,112 @@ def describe_check_matrices(
         "components": comp_info,
     }
     return out if return_dict else out
+
+
+def warmup_build_and_decode(
+    *,
+    check_matrices: Any,
+    dem: Any,
+    backend: str,
+    algo: str,
+    perf: str,
+    dtype: str,
+    pre_iter: int,
+    num_sets: int,
+    set_max_iter: int,
+    stop_nconv: int,
+    gamma0: float | None,
+    gamma_dist_interval: tuple[float, float] | None,
+    alpha: float | None,
+    beta: float | None,
+    device: str = "cuda",
+    seed: int = 0,
+    repeats: int = 3,
+    batch: int = 8,
+    parallel: bool = True,
+) -> None:
+    """
+    Build a fresh decoder with iteration limits forced to 1 and run warmup decodes.
+    Prints start/end and per-repeat timing.
+    """
+    sampler = dem.compile_sampler(seed=seed)
+
+    if backend == "triton":
+        from relay_bp_triton_adapter import RelayDecoder as _RelayDecoder
+        from relay_bp_triton_adapter import ObservableDecoderRunner as _ObservableDecoderRunner
+        _plain = (num_sets == 0) or (algo == "plain")
+        dec = _RelayDecoder(
+            check_matrices.check_matrix,
+            error_priors=check_matrices.error_priors,
+            gamma0=(0.0 if _plain else (gamma0 or 0.0)),
+            pre_iter=1,
+            num_sets=(0 if _plain else num_sets),
+            set_max_iter=(0 if _plain else 1),
+            gamma_dist_interval=((0.0, 0.0) if _plain else (gamma_dist_interval or (0.0, 0.0))),
+            stop_nconv=(1 if _plain else max(1, int(stop_nconv))),
+            alpha=(None if _plain else (alpha if alpha not in (None, 0.0) else 0.0)),
+            beta=(None if _plain else beta),
+            dtype_messages=("fp16" if dtype == "fp16" else "fp32"),
+            algo=("plain" if _plain else "relay"),
+            perf=perf,
+            device=device,
+            seed=int(seed or 0),
+        )
+        observable_decoder = _ObservableDecoderRunner(dec, check_matrices.observables_matrix, include_decode_result=True)
+    else:
+        import relay_bp as _rb
+        suffix = {"fp16": "F16", "fp32": "F32", "fp64": "F64"}.get(dtype)
+        if suffix is None:
+            raise ValueError("Unsupported dtype for rust warmup: " + str(dtype))
+        if algo == "plain":
+            minsum_name = f"MinSumBPDecoder{suffix}"
+            if not hasattr(_rb, minsum_name):
+                raise ValueError(f"Requested Rust plain decoder '{minsum_name}' not available")
+            MinSum = getattr(_rb, minsum_name)
+            dec = MinSum(
+                check_matrices.check_matrix,
+                error_priors=check_matrices.error_priors,
+                max_iter=1,
+                alpha=None,
+                gamma0=None,
+            )
+        else:
+            relay_name = f"RelayDecoder{suffix}"
+            if not hasattr(_rb, relay_name):
+                raise ValueError(f"Requested Rust relay decoder '{relay_name}' not available")
+            Relay = getattr(_rb, relay_name)
+            dec = Relay(
+                check_matrices.check_matrix,
+                error_priors=check_matrices.error_priors,
+                gamma0=(gamma0 or 0.0),
+                pre_iter=1,
+                num_sets=max(1, int(num_sets)),
+                set_max_iter=1,
+                gamma_dist_interval=(gamma_dist_interval or (0.0, 0.0)),
+                stop_nconv=max(1, int(stop_nconv)),
+                stopping_criterion="nconv",
+                seed=int(seed or 0),
+                alpha=(alpha if alpha not in (None, 0.0) else 0.0),
+                beta=beta,
+            )
+        from relay_bp import ObservableDecoderRunner as _ObservableDecoderRunner
+        observable_decoder = _ObservableDecoderRunner(
+            dec,
+            check_matrices.observables_matrix,
+            include_decode_result=True,
+        )
+
+    total_start = time.perf_counter()
+    print(f"[warmup] starting (repeats={int(repeats)}, batch={int(batch)}, backend={backend}, algo={algo}, perf={perf}, dtype={dtype})")
+    for i in range(int(repeats)):
+        rep_start = time.perf_counter()
+        _det, _obs, _warm_errors = sampler.sample(int(batch), return_errors=True)
+        _ = observable_decoder.from_errors_decode_observables_detailed_batch(
+            _warm_errors.astype(np.uint8, copy=False), parallel=parallel
+        )
+        rep_end = time.perf_counter()
+        ms = (rep_end - rep_start) * 1e3
+        print(f"[warmup] repeat {i+1}/{int(repeats)} took {ms:.3f} ms")
+    total_end = time.perf_counter()
+    total_ms = (total_end - total_start) * 1e3
+    print(f"[warmup] finished in {total_ms:.3f} ms")

@@ -538,15 +538,36 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
     total_decode_ns = 0
     total_decode_shots = 0
 
+    # Untimed warmup via utility: build a fresh fast decoder and run 3 passes
+    from relay_bp_triton.utils import warmup_build_and_decode
+    # Plain-BP warmup parameters: mimic plain degeneracy (no relay legs)
+    _warm_pre_iter = 1
+    _warm_num_sets = 0
+    _warm_set_max_iter = 0
+    _warm_stop_nconv = 1
+    warmup_build_and_decode(
+        check_matrices=check_matrices,
+        dem=dem,
+        backend=backend,
+        algo=algo,
+        perf=perf,
+        dtype=dtype,
+        pre_iter=_warm_pre_iter,
+        num_sets=_warm_num_sets,
+        set_max_iter=_warm_set_max_iter,
+        stop_nconv=_warm_stop_nconv,
+        gamma0=None,
+        gamma_dist_interval=None,
+        alpha=alpha,
+        beta=None,
+        device="cuda",
+        seed=seed,
+        repeats=3,
+        batch=batch,
+        parallel=parallel,
+    )
+    # Recreate sampler for the timed loop
     sampler = dem.compile_sampler(seed=seed)
-    # Untimed warmup to avoid including JIT/tuning in timings
-    try:
-        _det, _obs, _warm_errors = sampler.sample(batch, return_errors=True)
-        _ = observable_decoder.from_errors_decode_observables_detailed_batch(
-            _warm_errors.astype(np.uint8), parallel=parallel
-        )
-    except Exception:
-        pass
     print(f"Collecting until {target_errors} errors or {max_shots} shots...")
     start_time = time.time()
 
