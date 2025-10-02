@@ -181,9 +181,9 @@ class RelayBPDecoder:
             perf=self.perf,
             msg_dtype=self.dtype_messages,
             check_every=int(os.getenv("RELAY_CHECK_EVERY", "1")),
-            btile=int(os.getenv("RELAY_BTILE", "16")),
-            rows_per_chk=int(os.getenv("RELAY_ROWS_PER_CHK", "8")),
-            rows_per_var=int(os.getenv("RELAY_ROWS_PER_VAR", "8")),
+            btile=64,               # fallback only; tuned meta overrides
+            rows_per_chk=16,        # fallback only
+            rows_per_var=16,        # fallback only
             c2v_block=0,
             c2v_warps=0,
             c2v_stages=0,
@@ -406,60 +406,53 @@ class RelayBPDecoder:
             # Fallback to full batch
             active_idx = torch.arange(B, device=self.device, dtype=torch.int32)
             B_active = B
-        grid = (self.C, (B_active + self.cfg.btile - 1) // self.cfg.btile)
+        # grid determined after loading tuned BTILE
         # Use per-iteration alpha schedule (matches _launch_c2v_kernel behavior)
         alpha = getattr(self, "_alpha_current", self.normalized_min_sum_alpha or 0.0)
         beta = self.offset_min_sum_beta or 0.0
         use_alpha = self.normalized_min_sum_alpha is not None
         use_beta = self.offset_min_sum_beta is not None
         msg_is_fp16 = (self.msg_dtype == torch.float16)
-        problem_key = {
-            "B": B, "C": self.C, "E": self.E,
-            "msg_is_fp16": msg_is_fp16,
-            "BTILE": self.cfg.btile,
-        }
-        meta_base = dict(
-            B=B, B_active=B_active, C=self.C, E=self.E,
-            alpha=alpha, beta=beta,
-            use_alpha=use_alpha, use_beta=use_beta,
-            msg_is_fp16=msg_is_fp16,
-            BTILE=int(self.cfg.btile),
-        )
+        problem_key = {"B": B, "C": self.C, "E": self.E, "msg_is_fp16": msg_is_fp16}
         saved = ac.try_get_saved("c2v_min_sum_btile_kernel", problem_key)
         if saved is None:
             from .autotune import build_btile_compute_configs
-            # Do NOT autotune BTILE here; keep BTILE fixed via self.cfg.btile.
-            # Strip any BTILE entries from candidate configs, only tune BLOCK_SIZE/warps/stages.
-            cfgs = []
-            for c in build_btile_compute_configs():
-                kw = dict(c.kwargs)
-                if 'BTILE' in kw:
-                    kw.pop('BTILE')
-                cfgs.append(dict(kw, num_warps=c.num_warps, num_stages=c.num_stages))
+            cfgs = [dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages) for c in build_btile_compute_configs()]
+            def _grid_fn(cfg):
+                bt = int(cfg.get('BTILE', self.cfg.btile))
+                return (self.C, (B_active + bt - 1) // bt)
             best = ac.bench_and_select(
                 kernel=c2v_min_sum_btile_kernel,
-                grid=grid,
+                grid=(self.C, 1),
                 args=(
                     tensors['muT'], tensors['nuT'],
                     self.graph.chk_ptr, self.graph.chk_edges,
                     tensors['syndrome'], active_idx,
                 ),
-                meta_base=meta_base,
+                meta_base=dict(B=B, B_active=B_active, C=self.C, E=self.E,
+                               alpha=alpha, beta=beta,
+                               use_alpha=use_alpha, use_beta=use_beta,
+                               msg_is_fp16=msg_is_fp16),
                 configs=cfgs,
                 number=20,
+                grid_fn=_grid_fn,
             )
             ac.set_saved("c2v_min_sum_btile_kernel", problem_key, best)
             saved = best
         if self._tune_log and "c2v_min_sum_btile_kernel" not in self._tune_logged:
             print(f"[relay-bp-triton] Using cached meta for c2v_min_sum_btile_kernel from {ac.DEFAULT_CACHE} key={problem_key}")
             self._tune_logged.add("c2v_min_sum_btile_kernel")
-        # Fixed BTILE is already in meta_base
-        kw = {'BLOCK_SIZE': int(saved['BLOCK_SIZE'])}
+        btile = int(saved.get('BTILE', self.cfg.btile))
+        grid = (self.C, (B_active + btile - 1) // btile)
+        kw = {'BLOCK_SIZE': int(saved.get('BLOCK_SIZE', 64)), 'BTILE': btile}
         c2v_min_sum_btile_kernel[grid](
             tensors['muT'], tensors['nuT'],
             self.graph.chk_ptr, self.graph.chk_edges,
             tensors['syndrome'], active_idx,
-            **meta_base,
+            B=B, B_active=B_active, C=self.C, E=self.E,
+            alpha=alpha, beta=beta,
+            use_alpha=use_alpha, use_beta=use_beta,
+            msg_is_fp16=msg_is_fp16,
             **kw,
             num_warps=int(saved.get('num_warps', 0)),
             num_stages=int(saved.get('num_stages', 0)),
@@ -473,45 +466,47 @@ class RelayBPDecoder:
         use_alpha = self.normalized_min_sum_alpha is not None
         use_beta = self.offset_min_sum_beta is not None
 
-        total = B * self.C
-        grid = ((total + self.cfg.rows_per_chk - 1) // self.cfg.rows_per_chk,)
-
         msg_is_fp16 = (self.msg_dtype == torch.float16)
-        rows = self.cfg.rows_per_chk
-        problem_key = {"B": B, "C": self.C, "E": self.E, "msg_is_fp16": msg_is_fp16, "ROWS_PER_CHK": rows}
-        meta_base = dict(B=B, C=self.C, E=self.E, msg_is_fp16=msg_is_fp16, ROWS_PER_CHK=rows,
-                         alpha=alpha, beta=beta, use_alpha=use_alpha, use_beta=use_beta)
-
+        problem_key = {"B": B, "C": self.C, "E": self.E, "msg_is_fp16": msg_is_fp16}
         saved = ac.try_get_saved("c2v_min_sum_kernel", problem_key)
         if saved is None:
             from .autotune import build_c2v_configs
-            cfgs = [
-                dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages)
-                for c in build_c2v_configs()
-            ]
+            cfgs = [dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages) for c in build_c2v_configs()]
+            def _grid_fn(cfg):
+                rows = int(cfg.get('ROWS_PER_CHK', self.cfg.rows_per_chk))
+                total = B * self.C
+                return ((total + rows - 1) // rows,)
             best = ac.bench_and_select(
                 kernel=c2v_min_sum_kernel,
-                grid=grid,
+                grid=(1,),
                 args=(
                     tensors['mu'], tensors['nu'],
                     self.graph.chk_ptr, self.graph.chk_edges,
                     tensors['syndrome'], tensors['active'],
                 ),
-                meta_base=meta_base,
+                meta_base=dict(B=B, C=self.C, E=self.E, msg_is_fp16=msg_is_fp16,
+                               alpha=alpha, beta=beta, use_alpha=use_alpha, use_beta=use_beta),
                 configs=cfgs,
                 number=20,
+                grid_fn=_grid_fn,
             )
             ac.set_saved("c2v_min_sum_kernel", problem_key, best)
             saved = best
         if self._tune_log and "c2v_min_sum_kernel" not in self._tune_logged:
             print(f"[relay-bp-triton] Using cached meta for c2v_min_sum_kernel from {ac.DEFAULT_CACHE} key={problem_key}")
             self._tune_logged.add("c2v_min_sum_kernel")
+        rows = int(saved.get('ROWS_PER_CHK', self.cfg.rows_per_chk))
+        grid = (((B * self.C) + rows - 1) // rows,)
         c2v_min_sum_kernel[grid](
             tensors['mu'], tensors['nu'],
             self.graph.chk_ptr, self.graph.chk_edges,
             tensors['syndrome'], tensors['active'],
-            **meta_base,
-            BLOCK_SIZE=int(saved['BLOCK_SIZE']),
+            B=B, C=self.C, E=self.E,
+            alpha=alpha, beta=beta,
+            use_alpha=use_alpha, use_beta=use_beta,
+            msg_is_fp16=msg_is_fp16,
+            BLOCK_SIZE=int(saved.get('BLOCK_SIZE', 64)),
+            ROWS_PER_CHK=rows,
             num_warps=int(saved.get('num_warps', 0)),
             num_stages=int(saved.get('num_stages', 0)),
         )
@@ -522,23 +517,19 @@ class RelayBPDecoder:
     
     def _launch_v2c_fused_gamma_kernel(self, tensors: Dict, B: int):
         """Launch variable-to-check and marginals kernel with fused gamma mixing."""
-        total = B * self.V
-        grid = ((total + self.cfg.rows_per_var - 1) // self.cfg.rows_per_var,)
         msg_is_fp16 = (self.msg_dtype == torch.float16)
-        rows = self.cfg.rows_per_var
-        problem_key = {"B": B, "V": self.V, "E": self.E, "msg_is_fp16": msg_is_fp16, "ROWS_PER_VAR": rows, "STORE_M": True}
-        meta_base = dict(B=B, V=self.V, E=self.E, msg_is_fp16=msg_is_fp16, ROWS_PER_VAR=rows, STORE_M=True)
-
+        problem_key = {"B": B, "V": self.V, "E": self.E, "msg_is_fp16": msg_is_fp16, "STORE_M": True}
         saved = ac.try_get_saved("v2c_and_marginals_fused_gamma_kernel", problem_key)
         if saved is None:
             from .autotune import build_v2c_configs
-            cfgs = [
-                dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages)
-                for c in build_v2c_configs()
-            ]
+            cfgs = [dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages) for c in build_v2c_configs()]
+            def _grid_fn(cfg):
+                rows = int(cfg.get('ROWS_PER_VAR', self.cfg.rows_per_var))
+                total = B * self.V
+                return ((total + rows - 1) // rows,)
             best = ac.bench_and_select(
                 kernel=v2c_and_marginals_fused_gamma_kernel,
-                grid=grid,
+                grid=(1,),
                 args=(
                     tensors['nu'], tensors['mu'],
                     self.graph.var_ptr, self.graph.var_edges,
@@ -546,23 +537,29 @@ class RelayBPDecoder:
                     tensors['active'],
                     self.lambda0, tensors['gamma'],
                 ),
-                meta_base=meta_base,
+                meta_base=dict(B=B, V=self.V, E=self.E, msg_is_fp16=msg_is_fp16, STORE_M=True),
                 configs=cfgs,
                 number=20,
+                grid_fn=_grid_fn,
             )
             ac.set_saved("v2c_and_marginals_fused_gamma_kernel", problem_key, best)
             saved = best
         if self._tune_log and "v2c_and_marginals_fused_gamma_kernel" not in self._tune_logged:
             print(f"[relay-bp-triton] Using cached meta for v2c_and_marginals_fused_gamma_kernel from {ac.DEFAULT_CACHE} key={problem_key}")
             self._tune_logged.add("v2c_and_marginals_fused_gamma_kernel")
+        rows = int(saved.get('ROWS_PER_VAR', self.cfg.rows_per_var))
+        grid = (((B * self.V) + rows - 1) // rows,)
         v2c_and_marginals_fused_gamma_kernel[grid](
             tensors['nu'], tensors['mu'],
             self.graph.var_ptr, self.graph.var_edges,
             tensors['lambda_'], tensors['M'], tensors['hard_dec'],
             tensors['active'],
             self.lambda0, tensors['gamma'],
-            **meta_base,
-            BLOCK_SIZE=int(saved['BLOCK_SIZE']),
+            B=B, V=self.V, E=self.E,
+            msg_is_fp16=msg_is_fp16,
+            BLOCK_SIZE=int(saved.get('BLOCK_SIZE', 64)),
+            STORE_M=True,
+            ROWS_PER_VAR=rows,
             num_warps=int(saved.get('num_warps', 0)),
             num_stages=int(saved.get('num_stages', 0)),
         )
@@ -631,24 +628,18 @@ class RelayBPDecoder:
             # Fallback to full batch
             active_idx = torch.arange(B, device=self.device, dtype=torch.int32)
             B_active = B
-        grid = (self.V, (B_active + self.cfg.btile - 1) // self.cfg.btile)
         msg_is_fp16 = (self.msg_dtype == torch.float16)
-        problem_key = {"B": B, "V": self.V, "E": self.E, "msg_is_fp16": msg_is_fp16, "BTILE": self.cfg.btile, "WRITE_HARD": write_hard, "STORE_M": store_m}
-        meta_base = dict(B=B, B_active=B_active, V=self.V, E=self.E, msg_is_fp16=msg_is_fp16, WRITE_HARD=write_hard, STORE_M=store_m, BTILE=int(self.cfg.btile))
+        problem_key = {"B": B, "V": self.V, "E": self.E, "msg_is_fp16": msg_is_fp16, "WRITE_HARD": write_hard, "STORE_M": store_m}
         saved = ac.try_get_saved("v2c_and_gamma_btile_kernel", problem_key)
         if saved is None:
             from .autotune import build_btile_compute_configs
-            # Do NOT autotune BTILE here; keep BTILE fixed via self.cfg.btile.
-            # Strip any BTILE entries from candidate configs, only tune BLOCK_SIZE/warps/stages.
-            cfgs = []
-            for c in build_btile_compute_configs():
-                kw = dict(c.kwargs)
-                if 'BTILE' in kw:
-                    kw.pop('BTILE')
-                cfgs.append(dict(kw, num_warps=c.num_warps, num_stages=c.num_stages))
+            cfgs = [dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages) for c in build_btile_compute_configs()]
+            def _grid_fn(cfg):
+                bt = int(cfg.get('BTILE', self.cfg.btile))
+                return (self.V, (B_active + bt - 1) // bt)
             best = ac.bench_and_select(
                 kernel=v2c_and_gamma_btile_kernel,
-                grid=grid,
+                grid=(self.V, 1),
                 args=(
                     tensors['nuT'], tensors['muT'],
                     self.graph.var_ptr, self.graph.var_edges,
@@ -656,25 +647,30 @@ class RelayBPDecoder:
                     tensors['M'], tensors['hard_dec'],
                     active_idx,
                 ),
-                meta_base=meta_base,
+                meta_base=dict(B=B, B_active=B_active, V=self.V, E=self.E, msg_is_fp16=msg_is_fp16, WRITE_HARD=write_hard, STORE_M=store_m),
                 configs=cfgs,
                 number=20,
+                grid_fn=_grid_fn,
             )
             ac.set_saved("v2c_and_gamma_btile_kernel", problem_key, best)
             saved = best
         if self._tune_log and "v2c_and_gamma_btile_kernel" not in self._tune_logged:
             print(f"[relay-bp-triton] Using cached meta for v2c_and_gamma_btile_kernel from {ac.DEFAULT_CACHE} key={problem_key}")
             self._tune_logged.add("v2c_and_gamma_btile_kernel")
-        # Fixed BTILE is already in meta_base
-        kw = {'BLOCK_SIZE': int(saved['BLOCK_SIZE'])}
+        btile = int(saved.get('BTILE', self.cfg.btile))
+        grid = (self.V, (B_active + btile - 1) // btile)
         v2c_and_gamma_btile_kernel[grid](
             tensors['nuT'], tensors['muT'],
             self.graph.var_ptr, self.graph.var_edges,
             tensors['lambda_'], self.lambda0, tensors['gamma'],
             tensors['M'], tensors['hard_dec'],
             active_idx,
-            **meta_base,
-            **kw,
+            B=B, B_active=B_active, V=self.V, E=self.E,
+            msg_is_fp16=msg_is_fp16,
+            BLOCK_SIZE=int(saved.get('BLOCK_SIZE', 64)),
+            BTILE=btile,
+            WRITE_HARD=write_hard,
+            STORE_M=store_m,
             num_warps=int(saved.get('num_warps', 0)),
             num_stages=int(saved.get('num_stages', 0)),
         )

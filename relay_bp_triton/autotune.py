@@ -4,7 +4,7 @@ import hashlib
 import platform
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable
 import itertools, random
 import triton
 import triton.testing as ttesting
@@ -112,6 +112,7 @@ def bench_and_select(
     kernel, grid, args: Tuple, meta_base: Dict[str, Any],
     configs: List[Dict[str, Any]],
     number: int = 20,
+    grid_fn: Optional[Callable[[Dict[str, Any]], Tuple[int, ...]]] = None,
 ) -> Dict[str, Any]:
     verbose = os.getenv("RELAY_TUNE_VERBOSE", "0") == "1"
     best_t = float("inf")
@@ -123,15 +124,15 @@ def bench_and_select(
         conf_kwargs = {k: v for k, v in cfg.items() if k.isupper()}
         num_warps = cfg.get("num_warps")
         num_stages = cfg.get("num_stages")
-
-        kernel[grid](*args, **meta_base, **conf_kwargs, num_warps=num_warps, num_stages=num_stages)
+        grid_local = grid_fn(cfg) if grid_fn is not None else grid
+        kernel[grid_local](*args, **meta_base, **conf_kwargs, num_warps=num_warps, num_stages=num_stages)
         torch.cuda.synchronize()
         for _ in range(2):
-            kernel[grid](*args, **meta_base, **conf_kwargs, num_warps=num_warps, num_stages=num_stages)
+            kernel[grid_local](*args, **meta_base, **conf_kwargs, num_warps=num_warps, num_stages=num_stages)
         torch.cuda.synchronize()
 
         def run():
-            kernel[grid](*args, **meta_base, **conf_kwargs, num_warps=num_warps, num_stages=num_stages)
+            kernel[grid_local](*args, **meta_base, **conf_kwargs, num_warps=num_warps, num_stages=num_stages)
 
         t = ttesting.do_bench(run, rep=number)
         if verbose:
@@ -201,26 +202,29 @@ def _make_configs(space: dict[str, list[int]], cap: int | None = None) -> list[t
 
 
 def build_c2v_configs() -> list[triton.Config]:
-    bs  = _parse_list("RELAY_SWEEP_C2V_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128, 256])
-    wp  = _parse_list("RELAY_SWEEP_C2V_WARPS",  [1, 2, 4, 8])
-    stg = _parse_list("RELAY_SWEEP_C2V_STAGES", [1, 2, 3])
-    space = {"BLOCK_SIZE": bs, "num_warps": wp, "num_stages": stg}
+    bs = _parse_list("RELAY_SWEEP_C2V_BLOCK",  [32, 64, 128, 256])
+    r = _parse_list("RELAY_SWEEP_ROWS_PER_CHK", [4, 8, 16, 32])
+    wp = _parse_list("RELAY_SWEEP_C2V_WARPS",  [1, 2, 4, 8])
+    st = _parse_list("RELAY_SWEEP_C2V_STAGES", [1, 2, 3])
+    space = {"BLOCK_SIZE": bs, "ROWS_PER_CHK": r, "num_warps": wp, "num_stages": st}
     return _make_configs(space)
 
 
 def build_v2c_configs() -> list[triton.Config]:
-    bs  = _parse_list("RELAY_SWEEP_V2C_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128, 256])
-    wp  = _parse_list("RELAY_SWEEP_V2C_WARPS",  [1, 2, 4, 8])
-    stg = _parse_list("RELAY_SWEEP_V2C_STAGES", [1, 2, 3])
-    space = {"BLOCK_SIZE": bs, "num_warps": wp, "num_stages": stg}
+    bs = _parse_list("RELAY_SWEEP_V2C_BLOCK",  [32, 64, 128, 256])
+    r = _parse_list("RELAY_SWEEP_ROWS_PER_VAR", [4, 8, 16, 32])
+    wp = _parse_list("RELAY_SWEEP_V2C_WARPS",  [1, 2, 4, 8])
+    st = _parse_list("RELAY_SWEEP_V2C_STAGES", [1, 2, 3])
+    space = {"BLOCK_SIZE": bs, "ROWS_PER_VAR": r, "num_warps": wp, "num_stages": st}
     return _make_configs(space)
 
 
 def build_btile_compute_configs() -> list[triton.Config]:
-    bs  = _parse_list("RELAY_SWEEP_BT_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128, 256])
+    bs  = _parse_list("RELAY_SWEEP_BT_BLOCK",  [32, 64, 128, 256])
     wp  = _parse_list("RELAY_SWEEP_BT_WARPS",  [1, 2, 4, 8])
     stg = _parse_list("RELAY_SWEEP_BT_STAGES", [1, 2, 3])
-    space = {"BLOCK_SIZE": bs, "num_warps": wp, "num_stages": stg}
+    bt  = _parse_list("RELAY_SWEEP_BTILE",     [16, 32, 64, 128])
+    space = {"BLOCK_SIZE": bs, "BTILE": bt, "num_warps": wp, "num_stages": stg}
     return _make_configs(space)
 
 
@@ -233,7 +237,7 @@ def build_btile_transpose_configs() -> list[triton.Config]:
 
 
 def build_parity_configs() -> list[triton.Config]:
-    bs  = _parse_list("RELAY_SWEEP_PAR_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128, 256])
+    bs  = _parse_list("RELAY_SWEEP_PAR_BLOCK",  [16, 32, 64, 128, 256])
     wp  = _parse_list("RELAY_SWEEP_PAR_WARPS",  [1, 2, 4, 8])
     stg = _parse_list("RELAY_SWEEP_PAR_STAGES", [1, 2, 3])
     space = {"BLOCK_SIZE": bs, "num_warps": wp, "num_stages": stg}
