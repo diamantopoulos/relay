@@ -3,15 +3,50 @@ import json
 import hashlib
 import platform
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Callable
 import itertools, random
 import triton
 import triton.testing as ttesting
 import torch
-
+import csv
 
 DEFAULT_CACHE = Path(os.getenv("RELAY_TUNE_CACHE", "~/.cache/relay_bp_tune.json")).expanduser()
+
+# Optional CSV logging (set RELAY_TUNE_LOG_CSV to enable)
+RUN_ID = os.getenv("RELAY_TUNE_RUN_ID", datetime.now(timezone.utc).isoformat())
+LOG_CSV_PATH = os.getenv("RELAY_TUNE_LOG_CSV", "./autotuner_"+RUN_ID+".csv").strip()
+
+def _csv_log_enabled() -> bool:
+    return bool(LOG_CSV_PATH)
+
+def _safe_str(x):
+    try:
+        return json.dumps(x, sort_keys=True)
+    except Exception:
+        return str(x)
+
+def _append_csv_row(row: dict):
+    if not _csv_log_enabled():
+        return
+    path = Path(LOG_CSV_PATH).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = (not path.exists()) or (path.exists() and path.stat().st_size == 0)
+    fieldnames = [
+        "timestamp", "run_id",
+        "kernel", "backend", "device_name", "device_index", "sm",
+        "torch", "triton",
+        "rep", "trial_idx", "trial_total",
+        "grid", "BLOCK_SIZE", "ROWS_PER_CHK", "ROWS_PER_VAR", "BTILE",
+        "num_warps", "num_stages",
+        "time_s", "best_so_far",
+        "problem_key", "meta_base",
+    ]
+    with path.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            w.writeheader()
+        w.writerow({k: row.get(k, "") for k in fieldnames})
 
 
 def _fingerprint() -> Dict[str, Any]:
@@ -101,7 +136,7 @@ def set_saved(kernel_name: str, problem_key: Dict[str, Any], meta: Dict[str, Any
         "problem": problem_key,
         "selected": meta,
         "fingerprint": _fingerprint(),
-        "saved_at": datetime.utcnow().isoformat() + "Z",
+        "saved_at": datetime.now(timezone.utc).isoformat(),
         "format": 2,
     }
     table[key] = record
@@ -118,8 +153,10 @@ def bench_and_select(
     best_t = float("inf")
     best_cfg: Optional[Dict[str, Any]] = None
     total = len(configs)
+    kname = getattr(kernel, "__name__", "kernel")
+    fp = _fingerprint()
     if verbose:
-        print(f"[relay-bp-triton] Tuning {getattr(kernel, '__name__', 'kernel')} with {total} configs, reps={number}")
+        print(f"[relay-bp-triton] Tuning {kname} with {total} configs, reps={number}")
     for idx, cfg in enumerate(configs, start=1):
         conf_kwargs = {k: v for k, v in cfg.items() if k.isupper()}
         num_warps = cfg.get("num_warps")
@@ -138,6 +175,31 @@ def bench_and_select(
         if verbose:
             cfg_str = ", ".join([f"{k}={v}" for k, v in conf_kwargs.items()])
             print(f"  [{idx}/{total}] {cfg_str}, warps={num_warps}, stages={num_stages} -> {t:.3e} s")
+        _append_csv_row({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "run_id": RUN_ID,
+            "kernel": kname,
+            "backend": fp.get("backend"),
+            "device_name": fp.get("device_name"),
+            "device_index": fp.get("device_index"),
+            "sm": fp.get("sm"),
+            "torch": fp.get("torch"),
+            "triton": fp.get("triton"),
+            "rep": number,
+            "trial_idx": idx,
+            "trial_total": total,
+            "grid": _safe_str(grid_local),
+            "BLOCK_SIZE": conf_kwargs.get("BLOCK_SIZE"),
+            "ROWS_PER_CHK": conf_kwargs.get("ROWS_PER_CHK"),
+            "ROWS_PER_VAR": conf_kwargs.get("ROWS_PER_VAR"),
+            "BTILE": conf_kwargs.get("BTILE"),
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "time_s": t,
+            "best_so_far": (t < best_t),
+            "problem_key": _safe_str({}),
+            "meta_base": _safe_str(meta_base),
+        })
         if t < best_t:
             best_t = t
             best_cfg = {"num_warps": num_warps, "num_stages": num_stages, **conf_kwargs}
@@ -191,8 +253,6 @@ def _make_configs(space: dict[str, list[int]], cap: int | None = None) -> list[t
         kw = dict(zip(keys, combo))
         bs = kw.get("BLOCK_SIZE", 0)
         warps = kw.get("num_warps", 0)
-        if bs and (bs % 16 != 0):
-            continue
         out.append(triton.Config(kw, num_warps=kw.get("num_warps", 2), num_stages=kw.get("num_stages", 2)))
     out = out[:_cap(cap)]
     out = _sample(out)
@@ -201,7 +261,7 @@ def _make_configs(space: dict[str, list[int]], cap: int | None = None) -> list[t
 
 def build_c2v_configs() -> list[triton.Config]:
     bs = _parse_list("RELAY_SWEEP_C2V_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128, 256])
-    r = _parse_list("RELAY_SWEEP_ROWS_PER_CHK", [1, 2, 4, 8, 16, 32, 64])
+    r = _parse_list("RELAY_SWEEP_ROWS_PER_CHK", [1, 2, 4, 8])
     wp = _parse_list("RELAY_SWEEP_C2V_WARPS",  [1, 2, 4])
     st = _parse_list("RELAY_SWEEP_C2V_STAGES", [1, 2])
     space = {"BLOCK_SIZE": bs, "ROWS_PER_CHK": r, "num_warps": wp, "num_stages": st}
@@ -210,7 +270,7 @@ def build_c2v_configs() -> list[triton.Config]:
 
 def build_v2c_configs() -> list[triton.Config]:
     bs = _parse_list("RELAY_SWEEP_V2C_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128, 256])
-    r = _parse_list("RELAY_SWEEP_ROWS_PER_VAR", [1, 2, 4, 8, 16, 32, 64])
+    r = _parse_list("RELAY_SWEEP_ROWS_PER_VAR", [1, 2, 4, 8])
     wp = _parse_list("RELAY_SWEEP_V2C_WARPS",  [1, 2, 4])
     st = _parse_list("RELAY_SWEEP_V2C_STAGES", [1, 2])
     space = {"BLOCK_SIZE": bs, "ROWS_PER_VAR": r, "num_warps": wp, "num_stages": st}
@@ -218,7 +278,7 @@ def build_v2c_configs() -> list[triton.Config]:
 
 
 def build_btile_compute_configs() -> list[triton.Config]:
-    bs  = _parse_list("RELAY_SWEEP_BT_BLOCK",  [32, 64, 128, 256])
+    bs  = _parse_list("RELAY_SWEEP_BT_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128, 256])
     wp  = _parse_list("RELAY_SWEEP_BT_WARPS",  [1, 2, 4])
     stg = _parse_list("RELAY_SWEEP_BT_STAGES", [1, 2])
     bt  = _parse_list("RELAY_SWEEP_BTILE",     [16, 32, 64, 128])
