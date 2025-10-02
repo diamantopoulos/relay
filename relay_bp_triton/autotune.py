@@ -193,8 +193,6 @@ def _make_configs(space: dict[str, list[int]], cap: int | None = None) -> list[t
         warps = kw.get("num_warps", 0)
         if bs and (bs % 16 != 0):
             continue
-        if warps and warps not in (2, 4, 8):
-            continue
         out.append(triton.Config(kw, num_warps=kw.get("num_warps", 2), num_stages=kw.get("num_stages", 2)))
     out = out[:_cap(cap)]
     out = _sample(out)
@@ -202,27 +200,27 @@ def _make_configs(space: dict[str, list[int]], cap: int | None = None) -> list[t
 
 
 def build_c2v_configs() -> list[triton.Config]:
-    bs = _parse_list("RELAY_SWEEP_C2V_BLOCK",  [32, 64, 128, 256])
-    r = _parse_list("RELAY_SWEEP_ROWS_PER_CHK", [4, 8, 16, 32])
-    wp = _parse_list("RELAY_SWEEP_C2V_WARPS",  [1, 2, 4, 8])
-    st = _parse_list("RELAY_SWEEP_C2V_STAGES", [1, 2, 3])
+    bs = _parse_list("RELAY_SWEEP_C2V_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128, 256])
+    r = _parse_list("RELAY_SWEEP_ROWS_PER_CHK", [1, 2, 4, 8, 16, 32, 64])
+    wp = _parse_list("RELAY_SWEEP_C2V_WARPS",  [1, 2, 4])
+    st = _parse_list("RELAY_SWEEP_C2V_STAGES", [1, 2])
     space = {"BLOCK_SIZE": bs, "ROWS_PER_CHK": r, "num_warps": wp, "num_stages": st}
     return _make_configs(space)
 
 
 def build_v2c_configs() -> list[triton.Config]:
-    bs = _parse_list("RELAY_SWEEP_V2C_BLOCK",  [32, 64, 128, 256])
-    r = _parse_list("RELAY_SWEEP_ROWS_PER_VAR", [4, 8, 16, 32])
-    wp = _parse_list("RELAY_SWEEP_V2C_WARPS",  [1, 2, 4, 8])
-    st = _parse_list("RELAY_SWEEP_V2C_STAGES", [1, 2, 3])
+    bs = _parse_list("RELAY_SWEEP_V2C_BLOCK",  [1, 2, 4, 8, 16, 32, 64, 128, 256])
+    r = _parse_list("RELAY_SWEEP_ROWS_PER_VAR", [1, 2, 4, 8, 16, 32, 64])
+    wp = _parse_list("RELAY_SWEEP_V2C_WARPS",  [1, 2, 4])
+    st = _parse_list("RELAY_SWEEP_V2C_STAGES", [1, 2])
     space = {"BLOCK_SIZE": bs, "ROWS_PER_VAR": r, "num_warps": wp, "num_stages": st}
     return _make_configs(space)
 
 
 def build_btile_compute_configs() -> list[triton.Config]:
     bs  = _parse_list("RELAY_SWEEP_BT_BLOCK",  [32, 64, 128, 256])
-    wp  = _parse_list("RELAY_SWEEP_BT_WARPS",  [1, 2, 4, 8])
-    stg = _parse_list("RELAY_SWEEP_BT_STAGES", [1, 2, 3])
+    wp  = _parse_list("RELAY_SWEEP_BT_WARPS",  [1, 2, 4])
+    stg = _parse_list("RELAY_SWEEP_BT_STAGES", [1, 2])
     bt  = _parse_list("RELAY_SWEEP_BTILE",     [16, 32, 64, 128])
     space = {"BLOCK_SIZE": bs, "BTILE": bt, "num_warps": wp, "num_stages": stg}
     return _make_configs(space)
@@ -230,16 +228,16 @@ def build_btile_compute_configs() -> list[triton.Config]:
 
 def build_btile_transpose_configs() -> list[triton.Config]:
     btile = _parse_list("RELAY_SWEEP_TR_BTILE",  [8, 16, 32, 64, 128, 256])
-    wp    = _parse_list("RELAY_SWEEP_TR_WARPS",  [1, 2, 4, 8])
-    stg   = _parse_list("RELAY_SWEEP_TR_STAGES", [1, 2, 3])
+    wp    = _parse_list("RELAY_SWEEP_TR_WARPS",  [1, 2, 4])
+    stg   = _parse_list("RELAY_SWEEP_TR_STAGES", [1, 2])
     space = {"BTILE": btile, "num_warps": wp, "num_stages": stg}
     return _make_configs(space)
 
 
 def build_parity_configs() -> list[triton.Config]:
-    bs  = _parse_list("RELAY_SWEEP_PAR_BLOCK",  [16, 32, 64, 128, 256])
-    wp  = _parse_list("RELAY_SWEEP_PAR_WARPS",  [1, 2, 4, 8])
-    stg = _parse_list("RELAY_SWEEP_PAR_STAGES", [1, 2, 3])
+    bs  = _parse_list("RELAY_SWEEP_PAR_BLOCK",  [1, 2, 4, 16, 32, 64, 128, 256])
+    wp  = _parse_list("RELAY_SWEEP_PAR_WARPS",  [1, 2, 4])
+    stg = _parse_list("RELAY_SWEEP_PAR_STAGES", [1, 2])
     space = {"BLOCK_SIZE": bs, "num_warps": wp, "num_stages": stg}
     return _make_configs(space)
 
