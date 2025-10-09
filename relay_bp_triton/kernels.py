@@ -8,7 +8,23 @@
 # copyright notice, and modified files need to carry a notice indicating
 # that they have been altered from the originals.
 
-"""Triton kernels for Relay-BP-S belief propagation decoding."""
+"""Triton kernels for Relay-BP-S belief propagation decoding.
+
+This module contains GPU kernels implementing the core belief propagation operations
+for quantum error correction. The kernels closely follow the Rust implementation
+in crates/relay_bp/src/bp/min_sum.rs, providing GPU acceleration for:
+
+- Check-to-variable (C2V) message passing with min-sum algorithm
+- Variable-to-check (V2C) message passing with gamma mixing
+- Parity checking for syndrome validation
+- Memory management and tensor operations
+
+Key kernels:
+- c2v_min_sum_kernel: Implements min-sum check node updates
+- v2c_and_marginals_fused_gamma_kernel: Variable node updates with memory mixing
+- parity_*_kernel: Syndrome validation kernels
+- Various utility kernels for memory management and batch processing
+"""
 
 import triton
 import triton.language as tl
@@ -27,7 +43,28 @@ def c2v_min_sum_kernel(
     BLOCK_SIZE: tl.constexpr,
     ROWS_PER_CHK: tl.constexpr,  # Number of check rows to process per program
 ):
-    """Check-to-variable min-sum kernel with proper two-pass implementation (batched)."""
+    """Check-to-variable min-sum kernel implementing belief propagation check node updates.
+    
+    This kernel implements the min-sum algorithm for check nodes in belief propagation,
+    corresponding to the compute_check_to_variable function in Rust min_sum.rs.
+    
+    For each check node, it computes outgoing messages to variable nodes using:
+    1. Two-pass algorithm to find min1, min2, and parity
+    2. Min-sum rule with optional alpha/beta scaling
+    3. Syndrome integration for quantum error correction
+    
+    Args:
+        mu, nu: Message tensors [B,E] (variable-to-check, check-to-variable)
+        chk_ptr, chk_edges: CSR representation of check constraints
+        syndrome: [B,C] syndrome bits from quantum measurements
+        active: [B] mask for active decoding lanes
+        B, C, E: batch size, number of checks, number of edges
+        alpha, beta: min-sum scaling parameters
+        use_alpha, use_beta: flags for parameter usage
+        msg_is_fp16: whether messages are stored in fp16
+        BLOCK_SIZE: vectorization block size
+        ROWS_PER_CHK: number of check rows processed per program
+    """
     pid = tl.program_id(axis=0)
     base = pid * ROWS_PER_CHK
     
@@ -48,7 +85,7 @@ def c2v_min_sum_kernel(
                 deg = row_end - row_start
                 if deg > 0:
                     deg_is_one = deg == 1
-                    # ---------- PASS 1: parity + min1/min2/argmin + cnt_min1 (vectorized) ----------
+                    # PASS 1: Compute parity and find min1/min2 values (vectorized)
                     neg_parity = tl.zeros((), dtype=tl.int32)
                     min1 = tl.full((), 1e30, dtype=tl.float32)  # fp32 for accuracy
                     min2 = tl.full((), 1e30, dtype=tl.float32)  # fp32 for accuracy
@@ -97,7 +134,7 @@ def c2v_min_sum_kernel(
                     par_bit = ((neg_parity & 1) ^ syn)
                     sign_prod = tl.where(par_bit == 0, 1.0, -1.0)
 
-                    # ---------- PASS 2: write nu (vectorized) ----------
+                    # PASS 2: Write outgoing messages (vectorized)
                     tile = row_start
                     while tile < row_end:
                         offs = tile + tl.arange(0, BLOCK_SIZE)
@@ -133,6 +170,7 @@ def v2c_and_marginals_kernel(
     nu, mu, var_ptr, var_edges, lam, M, hard_dec,
     B, V, E, msg_is_fp16: tl.constexpr, BLOCK_SIZE: tl.constexpr,
 ):
+    """Deprecated: use v2c_and_marginals_fused_gamma_kernel instead."""
     return  # dead kernel removed; fused kernel is used instead
 
 
@@ -149,7 +187,32 @@ def v2c_and_marginals_fused_gamma_kernel(
     STORE_M: tl.constexpr,  # Whether to store M (for bandwidth optimization)
     ROWS_PER_VAR: tl.constexpr,  # Number of variable rows to process per program
 ):
-    """Variable-to-check and marginals kernel with fused gamma mixing (batched)."""
+    """Variable-to-check kernel with fused gamma mixing for memory-based belief propagation.
+    
+    This kernel implements variable node updates in belief propagation with memory mixing,
+    corresponding to the compute_variable_to_check function in Rust min_sum.rs.
+    
+    For each variable node, it:
+    1. Computes incoming message sum from check nodes
+    2. Updates marginals (beliefs) and hard decisions
+    3. Applies gamma mixing: λ = (1-γ)*λ₀ + γ*M (memory-based update)
+    4. Computes outgoing messages to check nodes
+    
+    The gamma mixing implements the "memory" aspect of Relay-BP, where previous
+    beliefs are mixed with current beliefs using memory strength γ.
+    
+    Args:
+        nu, mu: Message tensors [B,E] (check-to-variable, variable-to-check)
+        var_ptr, var_edges: CSR representation of variable constraints
+        lam, M, hard_dec: [B,V] beliefs, marginals, hard decisions
+        active: [B] mask for active decoding lanes
+        lam0, gamma: [1,V], [B,V] prior beliefs and memory strengths
+        B, V, E: batch size, number of variables, number of edges
+        msg_is_fp16: whether messages are stored in fp16
+        BLOCK_SIZE: vectorization block size
+        STORE_M: whether to store marginals (bandwidth optimization)
+        ROWS_PER_VAR: number of variable rows processed per program
+    """
     pid = tl.program_id(axis=0)
     base = pid * ROWS_PER_VAR
     
@@ -169,7 +232,7 @@ def v2c_and_marginals_fused_gamma_kernel(
                 row_end   = tl.load(var_ptr + j + 1)
                 lam_bj    = tl.load(lam + b*V + j)
 
-                # PASS 1: sum incoming nu (vectorized)
+                # PASS 1: Sum incoming messages from check nodes (vectorized)
                 sum_nu = tl.zeros((), dtype=tl.float32)
                 tile = row_start
                 while tile < row_end:
@@ -185,13 +248,13 @@ def v2c_and_marginals_fused_gamma_kernel(
                     tl.store(M + b*V + j, M_bj_curr)  # Only store if needed
                 tl.store(hard_dec + b*V + j, (M_bj_curr < 0.0).to(tl.uint8))
 
-                # FUSED GAMMA MIXING with PREVIOUS marginals: lam = (1-γ)*λ0 + γ*M_prev
+                # FUSED GAMMA MIXING: λ = (1-γ)*λ₀ + γ*M (memory-based belief update)
                 g_bj = tl.load(gamma + b*V + j)           # [B,V]
                 lam0_j = tl.load(lam0 + j)                # [1,V]
                 lam_bj_new = (1.0 - g_bj) * lam0_j + g_bj * M_bj_curr
                 tl.store(lam + b*V + j, lam_bj_new)
 
-                # PASS 2: write mu = lam + (sum_nu - nu_e) using NEW lam (vectorized)
+                # PASS 2: Write outgoing messages using updated beliefs (vectorized)
                 tile = row_start
                 while tile < row_end:
                     offs = tile + tl.arange(0, BLOCK_SIZE)
@@ -268,6 +331,7 @@ def v2c_and_marginals_mu_damped_kernel(
 
 @triton.jit
 def gamma_mix_kernel(lam0, M_prev, gamma, lam, B, V):
+    """Deprecated: gamma mixing is now fused into v2c_and_marginals_fused_gamma_kernel."""
     return  # dead kernel removed; fused kernel is used instead
 
 
@@ -288,7 +352,24 @@ def parity_per_check_kernel(
     BLOCK_SIZE: tl.constexpr,
     ROWS_PER_CHK: tl.constexpr,  # Number of check rows to process per program
 ):
-    """Parity check kernel reading beliefs M and deriving bits via (M < 0)."""
+    """Parity check kernel for syndrome validation using belief marginals.
+    
+    This kernel validates whether the current hard decisions satisfy all check constraints,
+    corresponding to the check_convergence function in Rust min_sum.rs.
+    
+    For each check constraint, it computes the parity of connected variable bits
+    and compares with the syndrome to determine if the constraint is satisfied.
+    
+    Args:
+        M: [B,V] belief marginals (read-only)
+        chk_ptr, chk_edges: CSR representation of check constraints
+        edge_var: [E] variable index for each edge
+        syndrome: [B,C] syndrome bits from quantum measurements
+        check_ok: [B,C] output mask for satisfied constraints
+        B, C, V, E: batch size, checks, variables, edges
+        BLOCK_SIZE: vectorization block size
+        ROWS_PER_CHK: number of check rows processed per program
+    """
     pid = tl.program_id(axis=0)
     base = pid * ROWS_PER_CHK
     
@@ -331,7 +412,21 @@ def parity_from_hard_kernel(
     BLOCK_SIZE: tl.constexpr,
     ROWS_PER_CHK: tl.constexpr,  # Number of check rows to process per program
 ):
-    """Parity check kernel loading bits from hard_dec (uint8)."""
+    """Parity check kernel for syndrome validation using hard decisions.
+    
+    This kernel validates check constraints using pre-computed hard decisions,
+    optimized for throughput mode where marginals may not be stored.
+    
+    Args:
+        hard_dec: [B,V] hard decisions (0/1 bits)
+        chk_ptr, chk_edges: CSR representation of check constraints
+        edge_var: [E] variable index for each edge
+        syndrome: [B,C] syndrome bits from quantum measurements
+        check_ok: [B,C] output mask for satisfied constraints
+        B, C, V, E: batch size, checks, variables, edges
+        BLOCK_SIZE: vectorization block size
+        ROWS_PER_CHK: number of check rows processed per program
+    """
     pid = tl.program_id(axis=0)
     base = pid * ROWS_PER_CHK
     for r in tl.static_range(0, ROWS_PER_CHK):
@@ -370,7 +465,22 @@ def parity_from_hard_compact_kernel(
     BLOCK_SIZE: tl.constexpr,
     ROWS_PER_CHK: tl.constexpr,  # Number of check rows to process per program
 ):
-    """Parity check kernel loading bits from hard_dec (uint8) for active lanes only."""
+    """Parity check kernel for active lanes only (throughput mode optimization).
+    
+    This kernel validates check constraints for only the active decoding lanes,
+    reducing computation when many lanes have already converged.
+    
+    Args:
+        hard_dec: [B,V] hard decisions (0/1 bits)
+        chk_ptr, chk_edges: CSR representation of check constraints
+        edge_var: [E] variable index for each edge
+        syndrome: [B,C] syndrome bits from quantum measurements
+        check_ok: [B,C] output mask for satisfied constraints
+        active_idx: [B_active] indices of active batch lanes
+        B, B_active, C, V, E: batch size, active batch size, checks, variables, edges
+        BLOCK_SIZE: vectorization block size
+        ROWS_PER_CHK: number of check rows processed per program
+    """
     pid = tl.program_id(axis=0)
     base = pid * ROWS_PER_CHK
     for r in tl.static_range(0, ROWS_PER_CHK):
@@ -408,7 +518,11 @@ def zero_check_ok_inactive_kernel(
     BLOCK_B: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
-    """Zero out check_ok for inactive lanes to ensure clean parity statistics."""
+    """Zero out check_ok for inactive lanes to ensure clean parity statistics.
+    
+    This utility kernel ensures that inactive decoding lanes have zero check_ok values,
+    preventing them from contributing to convergence statistics.
+    """
     pid_b = tl.program_id(0)
     pid_c = tl.program_id(1)
 
@@ -445,10 +559,28 @@ def check_and_select_kernel(
     BLOCK_C: tl.constexpr,
     BLOCK_V: tl.constexpr,
 ):
-    """Reduce check_ok per lane and update best solution fully on device.
-
-    If all checks pass for lane b, compute current hard decisions and weight, then
-    atomically update best_weights/best_errors/valid_solutions when improved.
+    """Device-side solution selection and validation kernel.
+    
+    This kernel performs solution selection and validation entirely on device,
+    avoiding host-device transfers. For each lane, it:
+    1. Checks if all parity constraints are satisfied
+    2. Computes solution weight using log-prior ratios
+    3. Updates best solution if current solution is better
+    
+    This corresponds to the solution selection logic in Rust relay.rs.
+    
+    Args:
+        check_ok: [B,C] mask of satisfied constraints
+        M: [B,V] belief marginals (may be unused if USE_M==0)
+        hard_dec: [B,V] hard decisions
+        wj: [V] log-prior ratios for weight computation
+        best_weights: [B] current best weights (in/out)
+        best_errors: [B,V] current best error patterns (out)
+        valid_solutions: [B] valid solution flags (out)
+        found_count: [B] convergence counters (in/out)
+        B, C, V: batch size, checks, variables
+        USE_M: whether to use marginals or hard decisions for weight computation
+        BLOCK_C, BLOCK_V: vectorization block sizes
     """
     b = tl.program_id(axis=0)
     if b >= B:
@@ -514,7 +646,11 @@ def init_messages_kernel(
     N,
     BLOCK: tl.constexpr,
 ):
-    """Vectorized zero initialization over flattened [B*E]."""
+    """Initialize message tensors to zero.
+    
+    This utility kernel performs vectorized zero initialization of message tensors,
+    corresponding to the initialization in Rust min_sum.rs.
+    """
     pid = tl.program_id(axis=0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     m = offs < N
@@ -530,7 +666,11 @@ def reduce_all_ge_kernel(
     out_flag,         # [1] uint8 (out)
     B                 # scalar int32
 ):
-    """Tiny reduction: out_flag[0] = 1 iff for all b, found_count[b] >= stop_nconv."""
+    """Check if all lanes have converged (device-side reduction).
+    
+    This kernel performs a device-side reduction to check if all decoding lanes
+    have found enough valid solutions to stop early.
+    """
     pid = tl.program_id(axis=0)
     if pid != 0:
         return
@@ -553,14 +693,25 @@ def freeze_finished_lanes_kernel(
     found_count, first_iter, iter_counter,  # [B] int32, [B] int32, scalar int32
     stop_nconv, V: tl.constexpr
 ):
-    """Freeze lanes that reached the target and capture first_iter on device.
-
-    For lanes with (found_count >= stop_nconv) and first_iter < 0:
-      - first_iter[b] = iter_counter
-      - hard_dec[b, :] = best_errors[b, :]
-    For all lanes with (found_count >= stop_nconv):
-      - active[b] = 0
-      - gamma[b, :] = 0
+    """Freeze converged lanes and capture convergence iteration.
+    
+    This kernel implements lane freezing for converged solutions, corresponding
+    to the convergence handling in Rust relay.rs. For lanes that have found
+    enough valid solutions:
+    1. Records the first convergence iteration
+    2. Freezes the lane (sets active=0)
+    3. Resets gamma values to prevent further updates
+    
+    Args:
+        best_errors: [B,V] best error patterns found so far
+        hard_dec: [B,V] current hard decisions (updated for converged lanes)
+        gamma: [B,V] memory strengths (reset to 0 for converged lanes)
+        active: [B] active lane mask (set to 0 for converged lanes)
+        found_count: [B] convergence counters
+        first_iter: [B] first convergence iteration (updated for converged lanes)
+        iter_counter: scalar current iteration counter
+        stop_nconv: target number of solutions for convergence
+        V: number of variables
     """
     b = tl.program_id(axis=0)
     fc = tl.load(found_count + b)

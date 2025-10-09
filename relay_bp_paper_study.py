@@ -2,10 +2,17 @@
 """
 Relay-BP Paper Study Script
 
-This script replicates the paper's methodology exactly:
+This script replicates the paper's methodology exactly for comprehensive benchmarking
+of Relay-BP vs Plain-BP performance across different parameter configurations.
+
+Paper methodology:
 - X-axis: Average BP iteration count (not wall time)
 - Y-axis: Per-cycle logical error rate (not per-shot)
 - Parameters: S = solutions sought, R = max relay legs
+
+The script performs systematic parameter sweeps to generate performance curves
+matching the paper's analysis, supporting both Rust and Triton backends with
+comprehensive result tracking and export capabilities.
 """
 
 import json
@@ -18,7 +25,18 @@ from relay_bp_detailed import run_relay_bp_experiment, run_plain_bp_experiment
 
 
 class RelayBPPaperStudy:
-    """Study class for replicating the paper's methodology."""
+    """Study class for replicating the paper's methodology with systematic parameter sweeps.
+    
+    This class implements comprehensive benchmarking of Relay-BP vs Plain-BP performance
+    across different parameter configurations, generating performance curves that match
+    the paper's analysis methodology.
+    
+    Features:
+    - Systematic parameter sweeps (S, R, iteration limits)
+    - Multiple backend support (Rust/Triton)
+    - Incremental result saving for robustness
+    - Comprehensive CSV export with all metrics
+    """
     
     def __init__(self, output_dir: str = "paper_study_results"):
         self.output_dir = Path(output_dir)
@@ -26,6 +44,7 @@ class RelayBPPaperStudy:
         self.results = []
         
     def _csv_fieldnames(self) -> list[str]:
+        """Define CSV field names for comprehensive result export."""
         return [
             # Configuration parameters
             'config_name', 'algo', 'perf', 'backend', 'dtype', 'batch',
@@ -39,6 +58,7 @@ class RelayBPPaperStudy:
         ]
 
     def _row_from_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert experiment result to CSV row format."""
         return {
             'config_name': result.get('config_name', ''),
             'algo': result.get('algo', ''),
@@ -74,7 +94,11 @@ class RelayBPPaperStudy:
         }
 
     def save_result_incremental(self, result: Dict[str, Any]):
-        """Append a single result to CSV immediately (creates file with header if missing)."""
+        """Append a single result to CSV immediately for robustness during long runs.
+        
+        This method saves results incrementally to prevent data loss during
+        long-running parameter sweeps, creating both CSV and JSON backups.
+        """
         csv_path = self.output_dir / "paper_study_results.csv"
         write_header = not csv_path.exists() or csv_path.stat().st_size == 0
         with open(csv_path, 'a', newline='') as csvfile:
@@ -82,7 +106,8 @@ class RelayBPPaperStudy:
             if write_header:
                 writer.writeheader()
             writer.writerow(self._row_from_result(result))
-        # Also drop a JSON sidecar per run for robustness
+        
+        # Save JSON backup for robustness
         json_path = self.output_dir / f"{result.get('config_name','result')}.json"
         try:
             with open(json_path, 'w') as f:
@@ -92,17 +117,23 @@ class RelayBPPaperStudy:
 
     
     def define_configs(self) -> List[Dict[str, Any]]:
-        """Build a unified list of plain and relay configurations."""
+        """Build systematic parameter sweep configurations for paper replication.
+        
+        This method defines the parameter space for comprehensive benchmarking,
+        including Plain-BP iteration sweeps and Relay-BP parameter grids that
+        match the paper's methodology.
+        
+        Returns:
+            List of configuration dictionaries for systematic parameter sweeps
+        """
         configs: List[Dict[str, Any]] = []
         backends = ['rust', 'triton']
-        #batch_values = [32, 64, 128, 256, 512, 1024, 2048, 4096]
-        batch_values = [1]
+        batch_values = [1]  # Single batch for detailed analysis
 
-        # Plain BP sweep (no relay): vary set_max_iter per backend
+        # Plain BP sweep: vary max iterations to generate performance curves
         set_max_iter_values = [1, 5, 10, 20, 40, 60, 80, 100, 200, 300, 500, 600, 700, 1000, 1500, 2000, 5000, 10000]
         for backend in backends:
-            # Supported dtype per backend
-            dtypes = ['fp32'] #['fp16','fp32'] if backend == 'triton' else ['fp32','fp64']
+            dtypes = ['fp32']  # Focus on fp32 for consistency
             for dtype in dtypes:
                 for tmax in set_max_iter_values:
                     for batch in batch_values:
@@ -117,33 +148,46 @@ class RelayBPPaperStudy:
                             'alpha': None,
                         })
 
-        # Relay-BP sweep: fixed S (stop_nconv) values and R (num_sets) grid
-        #stop_nconv_values = [1, 2, 3, 5, 7, 9]
-        #num_sets_values = [1, 3, 5, 9, 13, 21, 45]
-        #for backend in backends:
-        #    for s in stop_nconv_values:
-        #        for r in num_sets_values:
-        #            configs.append({
-        #                'name': f'Relay-BP-S{s}-R{r}-{backend}',
-        #                'algo': 'relay',
-        #                'perf': ('throughput' if backend == 'triton' else 'default'),
-        #                'backend': backend,
-        #                'num_sets': r,
-        #                'gamma0': 0.125,
-        #                'gamma_dist_interval': (-0.24, 0.66),
-        #                'pre_iter': 80,
-        #                'set_max_iter': 60,
-        #                'stop_nconv': s,
-        #            })
+        # Relay-BP sweep: S (stop_nconv) and R (num_sets) parameter grid
+        # Uncomment to enable Relay-BP parameter sweeps
+        # stop_nconv_values = [1, 2, 3, 5, 7, 9]
+        # num_sets_values = [1, 3, 5, 9, 13, 21, 45]
+        # for backend in backends:
+        #     for s in stop_nconv_values:
+        #         for r in num_sets_values:
+        #             configs.append({
+        #                 'name': f'Relay-BP-S{s}-R{r}-{backend}',
+        #                 'algo': 'relay',
+        #                 'perf': ('throughput' if backend == 'triton' else 'default'),
+        #                 'backend': backend,
+        #                 'num_sets': r,
+        #                 'gamma0': 0.125,
+        #                 'gamma_dist_interval': (-0.24, 0.66),
+        #                 'pre_iter': 80,
+        #                 'set_max_iter': 60,
+        #                 'stop_nconv': s,
+        #             })
 
         return configs
 
     def run_any_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Run a single configuration and return results with metadata.
+        
+        This method executes either Plain-BP or Relay-BP experiments based on
+        the configuration, using the paper's standard circuit parameters.
+        
+        Args:
+            config: Configuration dictionary with algorithm parameters
+            
+        Returns:
+            Experiment results dictionary with performance metrics
+        """
         print(f"Running {config['name']}...")
         algo = config.get('algo', 'relay')
         perf = config.get('perf', 'default')
         backend = config.get('backend', None)
         dtype = config.get('dtype', 'fp32')
+        
         try:
             if algo == 'plain':
                 out = run_plain_bp_experiment(
@@ -154,7 +198,6 @@ class RelayBPPaperStudy:
                     error_rate=0.003,
                     set_max_iter=config['set_max_iter'],
                     alpha=config.get('alpha', None),
-                    # Configure study-local targets here (not via caller args)
                     target_errors=20,
                     batch=config.get('batch', 2048),
                     max_shots=1,
@@ -195,10 +238,13 @@ class RelayBPPaperStudy:
                 out['pre_iter'] = config['pre_iter']
                 out['set_max_iter'] = config['set_max_iter']
 
+            # Add configuration metadata
             out['config_name'] = config['name']
             out['backend'] = backend or ''
             out['perf'] = perf
             out['dtype'] = dtype
+            
+            # Print key results
             print(f"  LER: {out['logical_error_rate']:.2e}, Per-cycle LER: {out['per_cycle_logical_error_rate']:.2e}")
             if 'avg_legs' in out:
                 print(f"  Avg BP iterations: {out['avg_bp_iterations']:.1f} (legs: {out['avg_legs']:.1f})")
@@ -210,12 +256,15 @@ class RelayBPPaperStudy:
             return None
     
     def run_study(self):
-        """Run the complete study (targets configured inside run_any_config)."""
+        """Run the complete parameter sweep study for paper replication.
         
+        This method executes the systematic parameter sweeps defined in define_configs(),
+        running each configuration and saving results incrementally for robustness.
+        """
         print("Starting Paper Study (plain + relay)...")
         print("=" * 50)
         
-        # Build a combined configuration list (plain + relay), using algo/perf to discriminate
+        # Build configuration list for systematic parameter sweeps
         configs: List[Dict[str, Any]] = self.define_configs()
 
         for i, config in enumerate(configs):
@@ -226,11 +275,11 @@ class RelayBPPaperStudy:
                 self.results.append(result)
                 self.save_result_incremental(result)
 
-        # Save results
+        # Save final consolidated results
         self.save_results()
     
     def save_results(self):
-        """Save results to CSV."""
+        """Save consolidated results to CSV and display summary table."""
         if not self.results:
             print("No results to save")
             return
@@ -244,6 +293,7 @@ class RelayBPPaperStudy:
         
         print(f"Results saved to: {csv_path}")
     
+        # Display summary table matching paper format
         print("\nSummary Table:")
         print("=" * 100)
         print(f"{'R (num_sets)':<12} {'S (stop_nconv)':<15} {'BP Iterations':<15} {'LER':<12} {'Per-cycle LER':<15}")
@@ -258,7 +308,7 @@ class RelayBPPaperStudy:
     
 
 def main():
-    """Main function."""
+    """Main function for paper study script."""
     study = RelayBPPaperStudy()
     study.run_study()
 

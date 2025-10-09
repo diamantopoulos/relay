@@ -8,7 +8,12 @@
 # copyright notice, and modified files need to carry a notice indicating
 # that they have been altered from the originals.
 
-"""Utility functions for Relay-BP-S decoding."""
+"""Utility functions for Relay-BP-S decoding.
+
+This module provides utility functions for quantum error correction decoding,
+including error prior computation, gamma sampling, and matrix validation.
+These functions support the main Relay-BP algorithm implementation.
+"""
 
 from __future__ import annotations
 import torch
@@ -77,11 +82,15 @@ def bitunpack_errors(packed: torch.Tensor, V: int, bits_per_word: int = 32) -> t
 def compute_log_prior_ratios(error_priors: np.ndarray) -> np.ndarray:
     """Compute log prior ratios from error probabilities.
     
+    This function converts error probabilities to log-likelihood ratios used
+    in belief propagation, corresponding to the log_prior_ratios computation
+    in Rust min_sum.rs.
+    
     Args:
-        error_priors: [V] error probabilities in (0, 0.5)
+        error_priors: [V] error probabilities in (0, 0.5) for each qubit
         
     Returns:
-        [V] log prior ratios log((1-p)/p)
+        [V] log prior ratios log((1-p)/p) for belief propagation
     """
     # Clip probabilities to avoid numerical issues
     p = np.clip(error_priors, 1e-10, 0.5 - 1e-10)
@@ -113,18 +122,21 @@ def sample_gamma_uniform(
     gamma_min: float, gamma_max: float,
     device: str, seed: Optional[int] = None
 ) -> torch.Tensor:
-    """Sample gamma values from uniform distribution.
+    """Sample gamma values from uniform distribution for disordered memory.
+    
+    This function samples memory strength values for the disordered memory phase
+    of Relay-BP, corresponding to the gamma sampling in Rust relay.rs.
     
     Args:
         B: batch size
-        V: number of variables
-        gamma_min: minimum gamma value
-        gamma_max: maximum gamma value
-        device: target device
-        seed: random seed (optional)
+        V: number of variables (qubits)
+        gamma_min: minimum gamma value for memory strength
+        gamma_max: maximum gamma value for memory strength
+        device: target GPU device
+        seed: random seed for reproducibility
         
     Returns:
-        [B, V] gamma values
+        [B, V] gamma values for memory mixing
     """
     if seed is not None:
         torch.manual_seed(seed)
@@ -143,16 +155,19 @@ def sample_gamma_scalar(
     gamma_value: float,
     device: str
 ) -> torch.Tensor:
-    """Sample scalar gamma values (broadcast across variables).
+    """Sample scalar gamma values for ordered memory phase.
+    
+    This function creates uniform gamma values for the ordered memory phase
+    of Relay-BP, corresponding to the gamma0 parameter in Rust relay.rs.
     
     Args:
         B: batch size
-        V: number of variables
-        gamma_value: gamma value
-        device: target device
+        V: number of variables (qubits)
+        gamma_value: uniform gamma value for memory strength
+        device: target GPU device
         
     Returns:
-        [B, V] gamma values (all the same)
+        [B, V] gamma values (all identical)
     """
     return torch.full((B, V), gamma_value, device=device)
 
@@ -467,8 +482,8 @@ def warmup_build_and_decode(
     sampler = dem.compile_sampler(seed=seed)
 
     if backend == "triton":
-        from relay_bp_triton_adapter import RelayDecoder as _RelayDecoder
-        from relay_bp_triton_adapter import ObservableDecoderRunner as _ObservableDecoderRunner
+        from .adapter import RelayDecoder as _RelayDecoder
+        from .adapter import ObservableDecoderRunner as _ObservableDecoderRunner
         _plain = (num_sets == 0) or (algo == "plain")
         dec = _RelayDecoder(
             check_matrices.check_matrix,

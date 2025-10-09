@@ -13,6 +13,7 @@
 from .decoder import RelayBPDecoder
 from .graph import CSRGraph
 from .utils import bitpack_errors, bitunpack_errors
+from .adapter import RelayDecoder, ObservableDecoderRunner
 
 __version__ = "0.1.0"
-__all__ = ["RelayBPDecoder", "CSRGraph", "bitpack_errors", "bitunpack_errors"]
+__all__ = ["RelayBPDecoder", "CSRGraph", "bitpack_errors", "bitunpack_errors", "RelayDecoder", "ObservableDecoderRunner"]

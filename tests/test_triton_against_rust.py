@@ -1,21 +1,30 @@
 """
 Equivalence tests: Triton Relay-BP-S vs Rust relay_bp (Python frontend).
 
-We use a deterministic config so results are reproducible and comparable:
-  - num_sets=1
-  - gamma0=0.0
-  - gamma_dist_interval=(0.0, 0.0)
+This module provides comprehensive equivalence testing between the Triton GPU
+implementation and the Rust reference implementation of Relay-BP for quantum
+error correction. The tests ensure algorithmic fidelity and numerical consistency
+across different backends.
+
+Test methodology:
+- Deterministic configuration for reproducible results
+- Parity validation for quantum error correction correctness
+- Weight-based equivalence for different valid solutions
+- Batch processing consistency verification
+- Memory format and precision testing
+
+The tests use a deterministic configuration to ensure reproducible and comparable results:
+  - num_sets=1 (single ensemble)
+  - gamma0=0.0 (no memory mixing)
+  - gamma_dist_interval=(0.0, 0.0) (deterministic gamma)
   - fixed iteration counts
   - normalized_min_sum_alpha=1.0 (pure min-sum on Triton)
-  - stop_nconv=1
+  - stop_nconv=1 (single solution)
 
-The test mirrors the repo's testing approach (pytest under tests/) and the Python API
-style from README (relay_bp.RelayDecoderF32).
-
-Skip rules:
-  - If CUDA is unavailable (Triton needs GPU)
-  - If relay_bp (Rust bindings) isn't importable
-  - If our Triton backend isn't importable
+Skip conditions:
+  - CUDA unavailable (Triton requires GPU)
+  - relay_bp (Rust bindings) not importable
+  - Triton backend not importable
 """
 
 import os
@@ -25,16 +34,16 @@ import torch
 import pytest
 from scipy.sparse import csr_matrix
 
-# --- try importing Rust python frontend ---
+# Import Rust reference implementation
 try:
-    import relay_bp  # from this repo's package
+    import relay_bp  # Rust bindings from this repo's package
     HAS_RELAY_BP = True
 except Exception:
     HAS_RELAY_BP = False
 
-# --- try importing our Triton backend (adjust if your package name differs) ---
+# Import Triton GPU implementation
 try:
-    # If the Triton backend lives in-repo at <repo_root>/relay_bp_triton
+    # Add repo root to path for in-repo Triton backend
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
@@ -51,22 +60,31 @@ pytestmark = [
     pytest.mark.skipif(not HAS_TRITON_BACKEND, reason="relay_bp_triton not importable"),
 ]
 
-# ---------------- helpers ----------------
+# ---------------- Helper Functions ----------------
 
 def _probe_rust_min_sum_kwargs(base_kwargs):
-    """
-    Try to enforce pure min-sum on the Rust side.
-    Some wheels expose one or more of these; we only pass the ones that exist.
+    """Probe Rust decoder for min-sum parameter support.
+    
+    This function attempts to configure the Rust decoder for pure min-sum operation
+    by testing which parameters are available in the current wheel build. Different
+    builds may expose different parameter sets, so we probe and only use available ones.
+    
+    Args:
+        base_kwargs: Base configuration dictionary
+        
+    Returns:
+        Updated configuration with available min-sum parameters
     """
     import numpy as _np
     from scipy.sparse import csr_matrix as _csr
     import relay_bp as _relay_bp  # use already-imported module
 
     extras = {}
-    # Minimal 1x1 CSR and single prior for probing
+    # Minimal 1x1 CSR and single prior for parameter probing
     _H_probe = _csr(_np.array([[1]], dtype=_np.uint8))
     _p_probe = [0.01]
 
+    # Test candidate min-sum parameters
     candidates = [
         ("alpha", 1.0),
         ("alpha_iteration_scaling_factor", 0.0),
@@ -84,51 +102,86 @@ def _probe_rust_min_sum_kwargs(base_kwargs):
             )
             extras[k] = v
         except TypeError:
-            # kw not accepted by this wheel
+            # Parameter not accepted by this wheel build
             pass
         except Exception:
-            # accepted but value invalid for this build → don't pass it
+            # Parameter accepted but value invalid for this build
             pass
     return {**base_kwargs, **extras}
 
 
 def weight_from_priors(e_u8: np.ndarray, p: np.ndarray) -> float:
-    """Compute ML 'cost' w = sum_j e_j * log((1-p_j)/p_j)."""
+    """Compute maximum likelihood cost from error pattern and priors.
+    
+    This function computes the log-likelihood cost of an error pattern under
+    the given error priors, corresponding to the objective function used in
+    maximum likelihood decoding for quantum error correction.
+    
+    Args:
+        e_u8: Error pattern as uint8 array (0/1 values)
+        p: Error probabilities for each qubit
+        
+    Returns:
+        Log-likelihood cost: sum_j e_j * log((1-p_j)/p_j)
+    """
     wj = np.log((1.0 - p) / p)
     return float((e_u8 * wj).sum())
 
 
 def compare_with_ml_or_tie(H_csr, s_u8, p, e_rust, e_gpu, tol=1e-4):
-    """
-    If both decoders are parity-valid but disagree, require near-equal cost;
-    for tiny n (<=16), allow either one that exactly matches ML.
+    """Compare decoder outputs with maximum likelihood or weight-based equivalence.
+    
+    When both decoders produce parity-valid solutions but disagree on the specific
+    error pattern, this function validates equivalence by either:
+    1. For small problems (n <= 16): Accept if either decoder matches exact ML
+    2. For larger problems: Require near-equal log-likelihood costs
+    
+    This approach handles the fact that quantum error correction problems may have
+    multiple valid solutions with similar likelihoods.
+    
+    Args:
+        H_csr: Check matrix in CSR format
+        s_u8: Syndrome vector
+        p: Error priors
+        e_rust: Rust decoder output
+        e_gpu: GPU decoder output
+        tol: Tolerance for weight comparison
     """
     assert e_rust.dtype == np.uint8 and e_gpu.dtype == np.uint8
     assert parity_ok(H_csr, e_rust, s_u8)
     assert parity_ok(H_csr, e_gpu,  s_u8)
 
     if np.array_equal(e_rust, e_gpu):
-        return  # identical – done
+        return  # Identical solutions - no further validation needed
 
-    # Different codewords: check weights
+    # Different solutions: validate equivalence by weight comparison
     w_rust = weight_from_priors(e_rust, p)
     w_gpu  = weight_from_priors(e_gpu,  p)
 
     n = H_csr.shape[1]
     if n <= 16:
+        # For small problems, check against exact maximum likelihood
         e_ml, w_ml = brute_force_ml(H_csr, s_u8, p)
-        # Accept if either equals exact ML
         if e_ml is not None:
             rust_is_ml = np.array_equal(e_rust, e_ml) and abs(w_rust - w_ml) < 1e-6
             gpu_is_ml  = np.array_equal(e_gpu,  e_ml) and abs(w_gpu  - w_ml) < 1e-6
             if rust_is_ml or gpu_is_ml:
                 return
-    # Otherwise, require near-equal costs (same objective)
+    # For larger problems, require near-equal log-likelihood costs
     assert abs(w_rust - w_gpu) < tol, f"Unequal weights: rust={w_rust}, gpu={w_gpu}"
 
 
 
 def make_rust_decoder(H_csr, p):
+    """Create Rust decoder with deterministic configuration for testing.
+    
+    Args:
+        H_csr: Check matrix in CSR format
+        p: Error priors array
+        
+    Returns:
+        Configured Rust RelayDecoderF32 instance
+    """
     base_kwargs = dict(
         gamma0=0.0,
         pre_iter=200,
@@ -137,14 +190,15 @@ def make_rust_decoder(H_csr, p):
         gamma_dist_interval=(0.0, 1e-12),
         stop_nconv=1,
     )
-    # Force pure min-sum if the wheel exposes the knobs
+    # Configure for pure min-sum operation if supported
     base_kwargs = _probe_rust_min_sum_kwargs(base_kwargs)
 
-    # C-contiguous 1-D buffers for PyO3
+    # Prepare error priors in different formats for PyO3 compatibility
     p64 = np.array(p, dtype=np.float64, order="C", copy=True).ravel()
     p32 = np.array(p, dtype=np.float32, order="C", copy=True).ravel()
     p_list = [float(x) for x in p64]
 
+    # Try different data types for error priors
     try:
         return relay_bp.RelayDecoderF32(H_csr, error_priors=p64, **base_kwargs)
     except TypeError:
@@ -157,11 +211,21 @@ def make_rust_decoder(H_csr, p):
 
 
 def make_triton_decoder(H_csr, p, device="cuda", **overrides):
+    """Create Triton decoder with deterministic configuration for testing.
+    
+    This function constructs a RelayBPDecoder with deterministic settings and
+    handles unknown parameters gracefully to support different builds.
+    
+    Args:
+        H_csr: Check matrix in CSR format
+        p: Error priors array
+        device: GPU device ("cuda" or "rocm")
+        **overrides: Additional configuration parameters
+        
+    Returns:
+        Configured Triton RelayBPDecoder instance
     """
-    Construct RelayBPDecoder with sensible defaults and accept/ignore
-    unknown keyword arguments (so tests run across different builds).
-    """
-    # Default, deterministic config
+    # Default deterministic configuration for reproducible testing
     cfg = dict(
         H_csr=H_csr,
         error_priors=p,
@@ -180,24 +244,51 @@ def make_triton_decoder(H_csr, p, device="cuda", **overrides):
     )
     cfg.update(overrides)
 
-    # Try constructing; if a kw is unknown, drop it and retry.
+    # Handle unknown parameters by removing them and retrying
     while True:
         try:
             return RelayBPDecoder(**cfg)
         except TypeError as e:
             msg = str(e)
             if "unexpected keyword argument" in msg:
-                bad = msg.split("'")[1]  # extract kw name between quotes
+                bad = msg.split("'")[1]  # Extract parameter name
                 cfg.pop(bad, None)
                 continue
             raise
 
 def parity_ok(H_csr, e_u8, s_u8) -> bool:
+    """Check if error pattern satisfies syndrome constraints.
+    
+    This function verifies that the decoded error pattern produces the correct
+    syndrome when multiplied by the check matrix, which is the fundamental
+    requirement for valid quantum error correction.
+    
+    Args:
+        H_csr: Check matrix in CSR format
+        e_u8: Error pattern as uint8 array
+        s_u8: Syndrome vector as uint8 array
+        
+    Returns:
+        True if H @ e mod 2 == s, False otherwise
+    """
     return bool(np.all((H_csr.dot(e_u8.astype(np.uint8)) & 1) == s_u8))
 
 
 def brute_force_ml(H_csr, s_u8, p):
-    """Brute-force ML for tiny n<=16; returns (e, weight) or (None, inf)."""
+    """Compute exact maximum likelihood solution by brute force.
+    
+    This function exhaustively searches all possible error patterns to find
+    the one with minimum log-likelihood cost that satisfies the syndrome
+    constraints. Only feasible for small problems (n <= 16).
+    
+    Args:
+        H_csr: Check matrix in CSR format
+        s_u8: Syndrome vector
+        p: Error priors
+        
+    Returns:
+        Tuple of (error_pattern, weight) or (None, inf) if no solution found
+    """
     H = H_csr.toarray().astype(np.uint8)
     m, n = H.shape
     if n > 16:
@@ -205,6 +296,8 @@ def brute_force_ml(H_csr, s_u8, p):
     s = s_u8.astype(np.uint8)
     wj = np.log((1.0 - p) / p)
     best_e, best_w = None, float("inf")
+    
+    # Exhaustive search over all 2^n possible error patterns
     for x in range(1 << n):
         e = np.array([(x >> j) & 1 for j in range(n)], dtype=np.uint8)
         if np.all(((H @ e) & 1) == s):
@@ -213,10 +306,15 @@ def brute_force_ml(H_csr, s_u8, p):
                 best_w, best_e = w, e.copy()
     return best_e, best_w
 
-# ---------------- tests ----------------
+# ---------------- Test Functions ----------------
 
 def test_triangle_exact_match():
-    """3-var/2-check toy: expect exact match (or weight tie) and parity-valid."""
+    """Test exact equivalence on simple 3-variable, 2-check triangle code.
+    
+    This test uses a minimal quantum error correction code to verify that
+    both Rust and Triton implementations produce identical results or
+    equivalent solutions with the same log-likelihood cost.
+    """
     H = csr_matrix(np.array([[1, 1, 0],
                              [0, 1, 1]], dtype=np.uint8))
     H.sort_indices()
@@ -237,7 +335,7 @@ def test_triangle_exact_match():
         assert parity_ok(H, e_rust, s)
         assert parity_ok(H, e_gpu,  s)
         
-        # Residual syndrome equality checks
+        # Verify syndrome reproduction (fundamental QEC requirement)
         s_hat_rust = (H.dot(e_rust) & 1)
         s_hat_gpu = (H.dot(e_gpu) & 1)
         assert np.all(s_hat_rust == s), "Rust decode must reproduce the input syndrome"
@@ -245,7 +343,12 @@ def test_triangle_exact_match():
 
 
 def test_bitpacked_output():
-    """Test bit-packed output round-trip pack/unpack and parity."""
+    """Test bit-packed output format for memory efficiency.
+    
+    This test verifies that the Triton decoder can output error patterns in
+    a bit-packed format for memory efficiency, and that the round-trip
+    pack/unpack operations preserve correctness and satisfy syndrome constraints.
+    """
     from relay_bp_triton.utils import bitpack_errors, bitunpack_errors
     
     H = csr_matrix(np.array([[1, 1, 0, 0, 0, 0, 0, 0],
@@ -256,7 +359,7 @@ def test_bitpacked_output():
     p = np.clip(np.array([0.01] * 8, dtype=np.float64), 1e-6, 1 - 1e-6)
     s = np.array([1, 0, 1, 0], dtype=np.uint8)
     
-    # Test with bitpack_output=True
+    # Test bit-packed output mode
     try:
         gpu = make_triton_decoder(H, p, device="cuda", bitpack_output=True)
     except TypeError:
@@ -269,7 +372,7 @@ def test_bitpacked_output():
     packed_errors = out_gpu["errors"][0]  # Should be packed format
     valid_mask = out_gpu["valid_mask"][0].item()
     
-    # If the decoder didn't actually pack, skip rather than fail.
+    # Skip if decoder didn't actually pack (feature disabled in build)
     if packed_errors.dtype != torch.int32:
         pytest.skip("decoder returned unpacked errors; bitpacking disabled in this build")
     
@@ -277,7 +380,7 @@ def test_bitpacked_output():
     assert isinstance(packed_errors, torch.Tensor), "Packed errors should be a tensor"
     assert isinstance(valid_mask, bool), "Valid mask should be boolean"
     
-    # 1. Round-trip validation: unpack the packed errors
+    # Round-trip validation: unpack the packed errors
     V = 8  # number of variables
     unpacked_errors = bitunpack_errors(packed_errors.unsqueeze(0), V=V)[0]  # Remove batch dim
     
@@ -285,19 +388,19 @@ def test_bitpacked_output():
     assert torch.all((unpacked_errors == 0) | (unpacked_errors == 1)), "Unpacked errors should be binary"
     assert unpacked_errors.shape == (V,), f"Unpacked errors should have shape ({V},), got {unpacked_errors.shape}"
     
-    # 2. Memory efficiency validation
+    # Memory efficiency validation
     original_size = V  # bytes for uint8 array
     packed_size = packed_errors.numel() * 4  # bytes for int32 array (4 bytes per int32)
     assert packed_size <= original_size, f"Packed format should use less or equal memory: {packed_size} > {original_size}"
     
-    # 3. Parity check validation: verify unpacked errors satisfy syndrome constraints
+    # Parity check validation: verify unpacked errors satisfy syndrome constraints
     if valid_mask:  # Only check if the solution is valid
         # Convert to numpy for sparse matrix operations
         e_np = unpacked_errors.cpu().numpy().astype(np.uint8)
         s_hat = (H.dot(e_np) & 1).astype(np.uint8)
         assert np.array_equal(s_hat, s), f"Unpacked errors should satisfy syndrome: got {s_hat}, expected {s}"
     
-    # 4. Test manual round-trip: pack some known errors and unpack them
+    # Manual round-trip test: pack known errors and unpack them
     test_errors = torch.tensor([1, 0, 1, 1, 0, 0, 1, 0], dtype=torch.uint8, device="cuda")
     manually_packed = bitpack_errors(test_errors.unsqueeze(0), bits_per_word=32)[0]
     manually_unpacked = bitunpack_errors(manually_packed.unsqueeze(0), V=V)[0]
@@ -309,7 +412,17 @@ def test_bitpacked_output():
     (10, 5, 1),
 ])
 def test_random_small_graphs_equivalence(n, c, seed):
-    """Random small H; both decoders must be parity-valid. Prefer exact bit match; otherwise accept weight tie."""
+    """Test equivalence on randomly generated small quantum codes.
+    
+    This test generates random check matrices and verifies that both Rust and
+    Triton decoders produce parity-valid solutions. For different valid solutions,
+    it checks weight-based equivalence or exact maximum likelihood matching.
+    
+    Args:
+        n: Number of qubits (variables)
+        c: Number of checks (stabilizer generators)
+        seed: Random seed for reproducible test generation
+    """
     rng = np.random.default_rng(seed)
     H_dense = np.zeros((c, n), dtype=np.uint8)
     for i in range(c):
@@ -331,18 +444,18 @@ def test_random_small_graphs_equivalence(n, c, seed):
         e_gpu   = out_gpu["errors"][0].detach().cpu().numpy().astype(np.uint8)
         gpu_ok  = bool(out_gpu["valid_mask"][0].item())
 
-        # If GPU did not converge, just assert it marked the sample invalid and skip comparisons.
+        # Handle non-convergence: GPU should mark invalid and report infinite weight
         if not gpu_ok:
             w_gpu_api = float(out_gpu["weights"][0].item())
             assert not np.isfinite(w_gpu_api), "Non-converged decode must report infinite weight"
             continue
 
-        # GPU converged → require parity-valid.
+        # GPU converged: require parity-valid solution
         assert parity_ok(H, e_gpu, s), "Triton reported valid but parity fails"
 
         rust_ok = parity_ok(H, e_rust, s)
         if not rust_ok:
-            # Rust failed but GPU succeeded → check GPU equals ML when n<=16
+            # Rust failed but GPU succeeded: verify GPU solution is optimal
             e_ml, w_ml = brute_force_ml(H, s, p)
             if e_ml is not None:
                 w_gpu = weight_from_priors(e_gpu, p)
@@ -350,11 +463,16 @@ def test_random_small_graphs_equivalence(n, c, seed):
                 assert abs(w_gpu - w_ml) < 1e-6, "GPU weight must equal ML when Rust fails"
             continue
 
-        # Both parity-valid → compare (allow ML tie on tiny n)
+        # Both decoders produced valid solutions: compare for equivalence
         compare_with_ml_or_tie(H, s, p, e_rust, e_gpu, tol=1e-4)
 
 def test_batch_consistency_triangle():
-    """Batch-of-N equals N single decodes."""
+    """Test batch processing consistency on triangle code.
+    
+    This test verifies that batch processing produces the same results as
+    individual single-shot decodes, ensuring the batch implementation
+    maintains algorithmic correctness.
+    """
     H = csr_matrix(np.array([[1, 1, 0],
                              [0, 1, 1]], dtype=np.uint8))
     p = np.array([0.01, 0.01, 0.01], dtype=np.float64)
@@ -363,18 +481,20 @@ def test_batch_consistency_triangle():
     rust = make_rust_decoder(H, p)
     gpu  = make_triton_decoder(H, p, device="cuda")
 
-    # single-shot via rust
+    # Single-shot decoding via Rust (baseline)
     singles = np.stack([np.asarray(rust.decode(s), dtype=np.uint8) for s in S], axis=0)
 
-    # batch on GPU
+    # Batch decoding on GPU
     s_dev = torch.tensor(S, dtype=torch.uint8, device="cuda")
     out   = gpu.decode(s_dev)
     errs  = out["errors"].detach().cpu().numpy().astype(np.uint8)
 
+    # Verify all solutions are parity-valid
     for i in range(S.shape[0]):
         assert parity_ok(H, singles[i], S[i])
         assert parity_ok(H, errs[i],    S[i])
 
+    # Compare weights for different solutions
     wj = np.log((1.0 - p) / p)
     w_rust = (singles * wj).sum(axis=1)
     w_gpu  = (errs    * wj).sum(axis=1)
@@ -383,7 +503,12 @@ def test_batch_consistency_triangle():
 
 
 def test_fp16_messages_parity():
-    """fp16 messages must preserve parity; tiny weight drift allowed."""
+    """Test fp16 message precision preserves quantum error correction correctness.
+    
+    This test verifies that using fp16 precision for internal message passing
+    still produces parity-valid solutions, ensuring that reduced precision
+    doesn't compromise the fundamental correctness of quantum error correction.
+    """
     H = csr_matrix(np.array([[1,1,0],[0,1,1]], dtype=np.uint8))
     p = np.array([0.01, 0.01, 0.01], dtype=np.float64)
     S = np.array([[1,0],[0,1],[1,1]], dtype=np.uint8)
@@ -405,7 +530,7 @@ def test_fp16_messages_parity():
         assert parity_ok(H, e_rust, s)
         assert parity_ok(H, e_gpu,  s)
         
-        # Residual syndrome equality checks
+        # Verify syndrome reproduction (fundamental QEC requirement)
         s_hat_rust = (H.dot(e_rust) & 1)
         s_hat_gpu = (H.dot(e_gpu) & 1)
         assert np.all(s_hat_rust == s), "Rust decode must reproduce the input syndrome"
@@ -413,7 +538,12 @@ def test_fp16_messages_parity():
 
 
 def test_determinism():
-    """Run the same batch twice and assert identical outputs (bits and valid_mask)."""
+    """Test deterministic behavior across multiple runs.
+    
+    This test verifies that running the same decoding problem multiple times
+    produces identical results, ensuring reproducible behavior for both
+    Rust and Triton implementations.
+    """
     H = csr_matrix(np.array([[1, 1, 0, 0],
                              [0, 1, 1, 0],
                              [0, 0, 1, 1]], dtype=np.uint8))
@@ -424,7 +554,7 @@ def test_determinism():
     rust = make_rust_decoder(H, p)
     gpu = make_triton_decoder(H, p, device="cuda", seed=42)  # Fixed seed for determinism
     
-    # Run twice with same inputs
+    # Run decoding twice with identical inputs
     e_rust1 = np.asarray(rust.decode(s), dtype=np.uint8)
     e_rust2 = np.asarray(rust.decode(s), dtype=np.uint8)
     
@@ -436,14 +566,19 @@ def test_determinism():
     valid1 = out1["valid_mask"][0].item()
     valid2 = out2["valid_mask"][0].item()
     
-    # Assert deterministic outputs
+    # Verify deterministic behavior
     assert np.array_equal(e_rust1, e_rust2), "Rust decoder should be deterministic"
     assert np.array_equal(e_gpu1, e_gpu2), "Triton decoder should be deterministic"
     assert valid1 == valid2, "Triton valid_mask should be deterministic"
 
 
 def test_ensemble_relay_legs():
-    """Test with num_sets>1, set_max_iter>0, stop_nconv>1 to ensure batching logic and aggregation work correctly."""
+    """Test ensemble decoding with multiple relay legs.
+    
+    This test verifies that the ensemble decoding functionality works correctly
+    with multiple relay sets, ensuring that the batching logic and solution
+    aggregation maintain quantum error correction correctness.
+    """
     H = csr_matrix(np.array([[1, 1, 0, 0, 0],
                              [0, 1, 1, 0, 0],
                              [0, 0, 1, 1, 0],
@@ -452,14 +587,14 @@ def test_ensemble_relay_legs():
     p = np.clip(np.array([0.01, 0.01, 0.01, 0.01, 0.01], dtype=np.float64), 1e-6, 1 - 1e-6)
     s = np.array([1, 0, 1, 0], dtype=np.uint8)
     
-    # Rust decoder with ensemble settings
+    # Rust decoder with ensemble configuration
     rust = relay_bp.RelayDecoderF64(
         H, error_priors=p,
         gamma0=0.1, pre_iter=10, num_sets=2, set_max_iter=5,
         gamma_dist_interval=(0.0, 0.2), stop_nconv=2, seed=42
     )
     
-    # Triton decoder with same ensemble settings
+    # Triton decoder with matching ensemble configuration
     gpu = make_triton_decoder(H, p, device="cuda", 
                              gamma0=0.1, pre_iter=10, num_sets=2, set_max_iter=5,
                              gamma_dist_interval=(0.0, 0.2), stop_nconv=2, seed=42)
@@ -481,13 +616,18 @@ def test_ensemble_relay_legs():
 
 
 def test_high_degree_checks():
-    """Synthesize a row with large weight to exercise register/shared-mem pressure in Triton kernels."""
-    # Create a check with high degree (20 variables)
+    """Test high-degree check constraints to exercise GPU kernel memory pressure.
+    
+    This test creates check constraints with high variable degrees to stress-test
+    the Triton kernels under register and shared memory pressure, ensuring
+    robustness for complex quantum error correction codes.
+    """
+    # Create check matrix with varying constraint degrees
     n_vars = 25
     n_checks = 3
     H_dense = np.zeros((n_checks, n_vars), dtype=np.uint8)
     
-    # First check: high degree (20 variables)
+    # First check: high degree (20 variables) - stress test
     H_dense[0, :20] = 1
     
     # Second check: medium degree (10 variables) 
@@ -522,7 +662,15 @@ def test_high_degree_checks():
 
 @pytest.mark.parametrize("dtype_messages", ["fp32", "fp16"])
 def test_dtype_messages_parity(dtype_messages):
-    """Test both fp32 and fp16 message precision for GPU decoder."""
+    """Test message precision (fp32/fp16) preserves quantum error correction correctness.
+    
+    This test verifies that different floating-point precisions for internal
+    message passing still produce parity-valid solutions, ensuring numerical
+    stability across precision levels.
+    
+    Args:
+        dtype_messages: Message precision ("fp32" or "fp16")
+    """
     H = csr_matrix(np.array([[1, 1, 0, 0],
                              [0, 1, 1, 0],
                              [0, 0, 1, 1]], dtype=np.uint8))
@@ -549,7 +697,12 @@ def test_dtype_messages_parity(dtype_messages):
     assert np.all(s_hat_gpu == s), "GPU decode must reproduce the input syndrome"
 
 def test_unsorted_csr_equivalence():
-    """Ensure Triton kernels don't silently assume indices sorted."""
+    """Test Triton kernels handle unsorted CSR matrix indices correctly.
+    
+    This test verifies that the Triton implementation correctly handles
+    CSR matrices with unsorted column indices, ensuring robustness
+    regardless of matrix preprocessing.
+    """
     H = csr_matrix(np.array([[1,0,1,0],[0,1,1,1]], np.uint8))
     # Deliberately scramble columns within rows
     H_unsorted = csr_matrix((H.data, H.indices[::-1], H.indptr), shape=H.shape)  # unsorted
@@ -561,7 +714,7 @@ def test_unsorted_csr_equivalence():
     H_sorted.sort_indices()
     gpu_sorted = make_triton_decoder(H_sorted, p, device="cuda")
     
-    # Test with unsorted CSR
+    # Test with unsorted CSR (should produce equivalent results)
     gpu_unsorted = make_triton_decoder(H_unsorted, p, device="cuda")
     
     s_dev = torch.from_numpy(np.asarray([s], dtype=np.uint8)).to("cuda")
@@ -571,11 +724,11 @@ def test_unsorted_csr_equivalence():
     e_sorted = out_sorted["errors"][0].detach().cpu().numpy().astype(np.uint8)
     e_unsorted = out_unsorted["errors"][0].detach().cpu().numpy().astype(np.uint8)
     
-    # Both should produce valid solutions
+    # Both decoders should produce valid solutions
     assert parity_ok(H_sorted, e_sorted, s)
     assert parity_ok(H_unsorted, e_unsorted, s)
     
-    # Residual syndrome equality checks
+    # Verify syndrome reproduction (fundamental QEC requirement)
     s_hat_sorted = (H_sorted.dot(e_sorted) & 1)
     s_hat_unsorted = (H_unsorted.dot(e_unsorted) & 1)
     assert np.all(s_hat_sorted == s), "Triton decode must reproduce the input syndrome with sorted CSR"
@@ -583,10 +736,15 @@ def test_unsorted_csr_equivalence():
 
 
 def test_non_convergence_contract():
-    """If Triton marks invalid, weight should be inf and bits ignored."""
-    # Craft a tough instance by giving nearly uniform priors and high cycles
+    """Test non-convergence handling and contract compliance.
+    
+    This test verifies that when the Triton decoder fails to converge,
+    it correctly reports infinite weight and marks the solution as invalid,
+    ensuring proper error handling for difficult quantum error correction instances.
+    """
+    # Create difficult instance with ambiguous priors and high cycle count
     H = csr_matrix(np.array([[1,1,1,1,0,0],[0,1,1,0,1,1],[1,0,1,0,1,1]], np.uint8))
-    p = np.full(6, 0.5, np.float64)  # deliberately ambiguous
+    p = np.full(6, 0.5, np.float64)  # deliberately ambiguous priors
     s = np.array([1,1,1], np.uint8)
     gpu = make_triton_decoder(H, p, set_max_iter=0, num_sets=1, stop_nconv=1)  # minimal effort
     s_batch = np.array([s], dtype=np.uint8)
@@ -597,7 +755,12 @@ def test_non_convergence_contract():
 
 
 def test_variable_batch_shapes():
-    """Batched shapes often trigger subtle indexing bugs."""
+    """Test batch processing with various input shapes.
+    
+    This test verifies that batch processing handles different input shapes
+    correctly, ensuring that tensor indexing and memory layout work properly
+    across various batch sizes and dimensions.
+    """
     H = csr_matrix(np.array([[1,1,0],[0,1,1]], np.uint8))
     p = np.array([0.01,0.02,0.03], np.float64)
     S = np.array([[1,0],[0,1],[1,1],[0,0]], np.uint8)
@@ -605,7 +768,7 @@ def test_variable_batch_shapes():
     out = gpu.decode(torch.tensor(S, dtype=torch.uint8, device="cuda"))
     assert out["errors"].shape[0] == S.shape[0], "Output batch size should match input batch size"
     
-    # Verify all outputs have correct shape
+    # Verify all output tensors have correct shapes
     assert out["errors"].shape == (4, 3), f"Expected (4, 3), got {out['errors'].shape}"
     assert out["valid_mask"].shape == (4,), f"Expected (4,), got {out['valid_mask'].shape}"
     assert out["weights"].shape == (4,), f"Expected (4,), got {out['weights'].shape}"

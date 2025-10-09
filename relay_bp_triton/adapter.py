@@ -1,3 +1,17 @@
+"""
+Triton adapter for Relay-BP decoder providing compatibility with relay_bp interface.
+
+This module provides adapter classes that wrap the Triton GPU implementation
+to match the interface expected by the relay_bp package, enabling seamless
+integration with existing benchmarking and analysis tools.
+
+The adapter handles:
+- Interface compatibility between Triton and Rust backends
+- Observable decoding with error detection
+- Batch processing with detailed iteration tracking
+- Matrix format conversion and validation
+"""
+
 import numpy as np
 import torch
 from dataclasses import dataclass
@@ -8,19 +22,34 @@ try:
 except Exception:
     sp = None
 
-from relay_bp_triton.decoder import RelayBPDecoder as TritonDecoder
+from .decoder import RelayBPDecoder as TritonDecoder
 
 
 @dataclass
 class _ObsResult:
+    """Result container for observable decoding with detailed statistics.
+    
+    Attributes:
+        iterations: Number of BP iterations performed
+        converged: Whether the decoder converged to a valid solution
+        error_detected: Whether a logical error was detected
+        observables: Predicted observable values
+    """
     iterations: int
     converged: bool
     error_detected: bool
     observables: np.ndarray
 
-# relay_bp_triton_adapter.py
-
 class RelayDecoder:
+    """Adapter for Triton Relay-BP decoder providing relay_bp interface compatibility.
+    
+    This class wraps the Triton GPU implementation to match the interface expected
+    by the relay_bp package, enabling seamless integration with existing tools.
+    
+    The adapter handles matrix format conversion, parameter mapping, and provides
+    the same interface as the Rust implementation for benchmarking consistency.
+    """
+    
     def __init__(self, check_matrix, *, error_priors, gamma0, pre_iter, num_sets,
                  set_max_iter, gamma_dist_interval=(-0.24, 0.66), stop_nconv=1,
                  stopping_criterion="nconv", logging=False, device: str = "cuda",
@@ -33,13 +62,12 @@ class RelayDecoder:
                  alpha_iteration_scaling_factor: float = 1.0,
                  bitpack_output: bool = False,
                  **kwargs):
-        # Always coerce to csr_matrix (handles csr_array/coo/coo_array/etc.)
+        # Convert input to CSR matrix format (handles various sparse matrix types)
         if sp is not None:
             self.H_csr = sp.csr_matrix(check_matrix)
         else:
-            # very defensive fallback; Triton path really expects SciPy present
+            # Fallback for environments without SciPy (not recommended)
             H = np.asarray(check_matrix, dtype=np.uint8)
-            # tiny CSR shim: indices/indptr would be missing, so prefer installing SciPy
             from scipy.sparse import csr_matrix as _csr  # raises if SciPy missing
             self.H_csr = _csr(H)
 
@@ -48,6 +76,7 @@ class RelayDecoder:
         _gamma_interval = (0.0, 0.0) if _plain else tuple(gamma_dist_interval)
 
 
+        # Initialize underlying Triton decoder with mapped parameters
         self._dec = TritonDecoder(
             self.H_csr,
             error_priors=error_priors,
@@ -70,16 +99,25 @@ class RelayDecoder:
 
 
     def decode(self, syndrome: np.ndarray | torch.Tensor):
-        # Triton decoder is batched; wrap 1×C
+        """Decode syndrome using Triton GPU implementation.
+        
+        Args:
+            syndrome: Syndrome vector as numpy array or torch tensor
+            
+        Returns:
+            Dict containing decoding results with relay_bp interface compatibility
+        """
+        # Triton decoder expects batched input; wrap single syndrome as batch of size 1
         if isinstance(syndrome, np.ndarray):
             s = torch.from_numpy(syndrome.astype(np.uint8, copy=False)).to(self._dec.device).view(1, -1)
         else:
             s = syndrome.to(self._dec.device, dtype=torch.uint8).view(1, -1)
+        
         out = self._dec.decode(s)
         bits = out["errors"][0].to(torch.int8)
         converged = bool(out["valid_mask"][0].item())
-        # Real iterations reported by the Triton decoder
         iters = int(out.get("iterations", torch.tensor([self._dec.pre_iter], device=self._dec.device))[0].item())
+        
         return {
             "bits": bits,
             "posterior_llr": None,
@@ -91,6 +129,12 @@ class RelayDecoder:
 
 
 class ObservableDecoderRunner:
+    """Observable decoder runner providing batch processing with error detection.
+    
+    This class handles batch decoding of error patterns and computes observable
+    predictions with logical error detection, matching the relay_bp interface.
+    """
+    
     def __init__(self, decoder: RelayDecoder, observables_matrix, include_decode_result: bool = True, **kwargs):
         self.decoder = decoder
         if sp is not None and sp.issparse(observables_matrix):
@@ -101,7 +145,15 @@ class ObservableDecoderRunner:
         self.M = int(decoder.H_csr.shape[0])
 
     def _mul_mod2(self, A_csr, x: np.ndarray | torch.Tensor) -> np.ndarray:
-        # CPU path for observables/csr multiply
+        """Compute matrix-vector multiplication modulo 2 for observable computation.
+        
+        Args:
+            A_csr: Sparse matrix (observables or check matrix)
+            x: Vector (error pattern or decoded bits)
+            
+        Returns:
+            Result of A @ x mod 2 as uint8 array
+        """
         if sp is not None and sp.issparse(A_csr):
             y = A_csr @ (np.asarray(x, dtype=np.int8))
             return (np.asarray(y) % 2).astype(np.uint8)
@@ -110,13 +162,26 @@ class ObservableDecoderRunner:
         return y.astype(np.uint8)
 
     def from_errors_decode_observables_detailed_batch(self, errors: np.ndarray, parallel: bool = False) -> List[_ObsResult]:
+        """Decode batch of error patterns and compute observable predictions with error detection.
+        
+        This method implements the core benchmarking functionality, processing a batch
+        of error patterns and returning detailed statistics for each pattern including
+        iteration counts, convergence status, and logical error detection.
+        
+        Args:
+            errors: [B,N] array of error patterns to decode
+            parallel: Whether to use parallel processing (unused in Triton implementation)
+            
+        Returns:
+            List of _ObsResult objects containing detailed decoding statistics
+        """
         B, N = errors.shape
         assert N == self.decoder.N, f"N mismatch: errors has {N}, decoder has {self.decoder.N}"
 
-        # True observables on CPU
+        # Compute true observables from error patterns
         true_obs = self._mul_mod2(self._obs, errors.T).T  # (B,O)
 
-        # Build syndromes from errors via H @ e mod 2 (vectorized) on CPU
+        # Build syndromes from errors via H @ e mod 2 (vectorized)
         H = self.decoder.H_csr
         if sp is not None and sp.issparse(H):
             S = (H @ errors.T) % 2  # (M,B)
@@ -132,6 +197,7 @@ class ObservableDecoderRunner:
         iters = out.get("iterations", torch.full((B,), int(self.decoder._dec.pre_iter), device=self.decoder._dec.device, dtype=torch.int32)).to(torch.int32).cpu().numpy()
         pred_obs = self._mul_mod2(self._obs, bits.T).T
 
+        # Build results with logical error detection
         res: List[_ObsResult] = []
         valid = out["valid_mask"].to(torch.bool).cpu().numpy()
         for i in range(B):

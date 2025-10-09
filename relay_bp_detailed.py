@@ -2,8 +2,21 @@
 """
 Relay-BP Detailed Decoder Script
 
-This script directly uses Relay-BP decoder to get iteration counts and per-cycle error rates
-matching the paper's methodology.
+This script provides detailed analysis of Relay-BP and Plain-BP decoding performance,
+measuring iteration counts and per-cycle error rates to match the paper's methodology.
+It supports both Rust and Triton backends with comprehensive benchmarking capabilities.
+
+The script implements the exact methodology from the Relay-BP paper:
+- X-axis: Average BP iteration count (not wall time)
+- Y-axis: Per-cycle logical error rate (not per-shot)
+- Parameters: S = solutions sought, R = max relay legs
+
+Key features:
+- Detailed iteration counting for both Relay-BP and Plain-BP
+- Deterministic reproducibility with configurable seeding
+- Support for multiple backends (Rust/Triton) and data types
+- Comprehensive timing analysis (decoder-only and end-to-end)
+- Multiple output formats (simple, JSON, CSV)
 """
 
 import argparse
@@ -24,16 +37,28 @@ import json
 from relay_bp_triton.utils import describe_check_matrices
 
 def _select_backend(backend: str, dtype: str = 'fp32', require: str | None = None):
-    """Return dtype-aware decoder classes for the chosen backend.
-    For rust, returns (RelayDecoderXX, ObservableDecoderRunner, MinSumBPDecoderXX).
-    For triton, returns (RelayDecoderAdapter, ObservableDecoderRunner, None).
-    Errors if requested dtype class is unavailable (no silent fallback).
+    """Select appropriate decoder classes for the chosen backend and data type.
+    
+    This function provides a unified interface for selecting decoder implementations
+    across different backends (Rust/Triton) and data types (fp16/fp32/fp64).
+    
+    Args:
+        backend: "rust" or "triton" 
+        dtype: "fp16", "fp32", or "fp64" (availability depends on backend)
+        require: "relay", "plain", or None (which decoder types to require)
+        
+    Returns:
+        Tuple of (RelayDecoder, ObservableDecoderRunner, MinSumBPDecoder)
+        MinSumBPDecoder is None for Triton backend
+        
+    Raises:
+        ValueError: If requested dtype/backend combination is unavailable
     """
     if backend == "triton":
         if dtype not in ("fp16", "fp32"):
             raise ValueError("Triton supports only dtype in {'fp16','fp32'}")
-        from relay_bp_triton_adapter import RelayDecoder as _RelayDecoderAdapter
-        from relay_bp_triton_adapter import ObservableDecoderRunner as _ObservableDecoderRunner
+        from relay_bp_triton.adapter import RelayDecoder as _RelayDecoderAdapter
+        from relay_bp_triton.adapter import ObservableDecoderRunner as _ObservableDecoderRunner
         return _RelayDecoderAdapter, _ObservableDecoderRunner, None
     # rust (dtype-selected, mode-specific requirement)
     import relay_bp as _rb
@@ -59,7 +84,14 @@ def _select_backend(backend: str, dtype: str = 'fp32', require: str | None = Non
 
 
 def _format_time_units(ns: float) -> str:
-    """Return a compact string with ns, µs, ms, and s for a given nanoseconds value."""
+    """Format time in nanoseconds to a compact multi-unit string.
+    
+    Args:
+        ns: Time in nanoseconds
+        
+    Returns:
+        Formatted string showing time in ns, µs, ms, and seconds
+    """
     us = ns / 1e3
     ms = ns / 1e6
     s = ns / 1e9
@@ -67,13 +99,25 @@ def _format_time_units(ns: float) -> str:
 
 
 def _hash_update_arr(hasher: "hashlib._blake2.blake2b", arr) -> None:
-    """Update hasher with array data in C-order with stable dtype."""
+    """Update BLAKE2b hasher with array data for deterministic reproducibility.
+    
+    This function ensures deterministic results by hashing all relevant data
+    in a consistent order and format, enabling reproducible experiments.
+    
+    Args:
+        hasher: BLAKE2b hasher instance
+        arr: NumPy array to hash
+    """
     a = np.ascontiguousarray(arr)
     hasher.update(a.tobytes(order="C"))
 
 
 def parse_args():
-    """Parse command line arguments."""
+    """Parse command line arguments for Relay-BP detailed analysis.
+    
+    Returns:
+        argparse.Namespace: Parsed command line arguments
+    """
     parser = argparse.ArgumentParser(description='Run Relay-BP decoder with detailed iteration counting')
     
     # Mode parameter
@@ -117,7 +161,14 @@ def parse_args():
 
 
 def run_relay_bp_detailed(args):
-    """Run Relay-BP with detailed iteration counting."""
+    """Run Relay-BP experiment with detailed iteration counting.
+    
+    Args:
+        args: Parsed command line arguments
+        
+    Returns:
+        Dict containing experiment results and statistics
+    """
     return run_relay_bp_experiment(
         circuit=args.circuit,
         basis=args.basis,
@@ -146,7 +197,39 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
                            num_sets, set_max_iter, gamma_dist_min, gamma_dist_max, stop_nconv,
                            target_errors=20, batch=2000, max_shots=1000000, parallel=True, seed=0,
                            backend: str | None = None, perf: str = "default", dtype: str = 'fp32'):
-    """Run Relay-BP experiment with detailed iteration counting - reusable function."""
+    """Run Relay-BP experiment with detailed iteration counting and performance analysis.
+    
+    This function implements the core Relay-BP benchmarking methodology, measuring
+    iteration counts and logical error rates to match the paper's analysis.
+    
+    Args:
+        circuit: Circuit name/identifier
+        basis: Decoding basis ('z' or 'xz')
+        distance: Code distance
+        rounds: Number of syndrome measurement rounds
+        error_rate: Physical error rate
+        gamma0: Ordered memory parameter (γ₀)
+        pre_iter: Pre-iterations (T₀)
+        num_sets: Number of relay sets (R)
+        set_max_iter: Max iterations per set (Tr)
+        gamma_dist_min/max: Disordered memory parameter range
+        stop_nconv: Stop after N converged solutions (S)
+        target_errors: Target number of logical errors to collect
+        batch: Batch size for error sampling
+        max_shots: Maximum shots to collect
+        parallel: Enable parallel processing
+        seed: Random seed for reproducibility
+        backend: Decoder backend ('rust' or 'triton')
+        perf: Performance mode ('default', 'throughput', 'realtime')
+        dtype: Data type ('fp16', 'fp32', 'fp64')
+        
+    Returns:
+        Dict containing comprehensive experiment results including:
+        - Logical error rates (per-shot and per-cycle)
+        - Average BP iterations (paper's x-axis)
+        - Timing metrics (decoder-only and end-to-end)
+        - Determinism hash for reproducibility verification
+    """
     
     # Deterministic seeding using global seed
     random.seed(seed)
@@ -168,7 +251,7 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     # Create detector error model
     dem = circuit_obj.detector_error_model()
     
-    # Check observables count
+    # Print detector error model statistics
     print("DEM:",
         "detectors M =", dem.num_detectors,
         "observables O =", dem.num_observables,
@@ -177,7 +260,7 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     print("Basis =", basis)
 
     print(f"Using rounds={rounds} as the number of cycles for per-cycle LER conversion")
-    # Soft filename sanity check that circuit tag encodes distance/rounds
+    # Validate circuit configuration
     if isinstance(circuit, str):
         tag_ok = f"_{rounds}_" in circuit
         if not tag_ok:
@@ -187,11 +270,11 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
         "Use XZ (no filter) to match the paper."
     )
     
-    # Create check matrices
+    # Create check matrices and initialize reproducibility hasher
     check_matrices = CheckMatrices.from_dem(dem)
-    # Initialize determinism hasher (32-byte BLAKE2b)
     hasher = hashlib.blake2b(digest_size=32)
-    # Problem spec: H, observables, priors
+    
+    # Hash problem specification for deterministic reproducibility
     cm = check_matrices.check_matrix
     om = check_matrices.observables_matrix
     _hash_update_arr(hasher, cm.indptr.astype(np.int64, copy=False))
@@ -199,7 +282,8 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     _hash_update_arr(hasher, om.indptr.astype(np.int64, copy=False))
     _hash_update_arr(hasher, om.indices.astype(np.int64, copy=False))
     _hash_update_arr(hasher, check_matrices.error_priors.astype(np.float64, copy=False))
-    # Config + seeds
+    
+    # Hash configuration and seeds
     cfg_txt = json.dumps({
         "circuit": circuit, "basis": basis, "distance": distance, "rounds": rounds,
         "error_rate": error_rate, "gamma0": gamma0, "pre_iter": pre_iter,
@@ -210,7 +294,7 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
     }, sort_keys=True).encode()
     hasher.update(cfg_txt)
     
-    # Create Relay-BP decoder via selector (dtype-aware)
+    # Create Relay-BP decoder with backend-specific configuration
     _RelayDecoderDyn, _ObservableDecoderRunner, _ = _select_backend(backend, dtype, require='relay')
     relay_common_kwargs = dict(
         error_priors=check_matrices.error_priors,
@@ -223,7 +307,8 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
         stopping_criterion="nconv",
         logging=False,
     )
-    # Triton adapter accepts dtype_messages; Rust classes do not
+    
+    # Backend-specific decoder initialization
     if backend == 'triton':
         decoder = _RelayDecoderDyn(
             check_matrices.check_matrix,
@@ -243,39 +328,26 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
         include_decode_result=True,
     )
     
-    # BP iteration stats (paper's x-axis) and debug legs reporting
+    # Initialize statistics tracking
     avg_bp_iterations = 0.0
     avg_legs = 0.0
     legs_all = []
-    # Decoder-only timing accumulators (nanoseconds)
     total_decode_ns = 0
     total_decode_shots = 0
-    
     total_shots = 0
     total_errors = 0
     bp_iters_all = []
     
+    # Create error sampler and start timing
     sampler = dem.compile_sampler(seed=seed)
-    # Untimed warmup to avoid including JIT/tuning in timings
-    #try:
-    #    _det, _obs, _warm_errors = sampler.sample(batch, return_errors=True)
-    #    _ = observable_decoder.from_errors_decode_observables_detailed_batch(
-    #        _warm_errors.astype(np.uint8), parallel=parallel
-    #    )
-    #except Exception:
-    #    pass
     print(f"Collecting until {target_errors} errors or {max_shots} shots...")
-
-    # Measure time around the actual error-targeted collection loop
     start_time = time.time()
     
     while total_errors < target_errors and total_shots < max_shots:
-        # Use the proper evaluation path: sample errors and use from_errors_decode_observables_detailed_batch
-        #errors = np.load("errors.npy")        
+        # Sample errors and decode with detailed iteration tracking
         det, obs, errors = sampler.sample(batch, return_errors=True)
-        #np.save("errors.npy", errors)
         
-        # Single detailed decode that provides both iterations and built-in error counting
+        # Decode with timing measurement
         t0_ns = time.perf_counter_ns()
         obs_det = observable_decoder.from_errors_decode_observables_detailed_batch(
             errors.astype(np.uint8), parallel=parallel
@@ -284,13 +356,16 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
         if t0_ns is not None and t1_ns is not None:
             total_decode_ns += (t1_ns - t0_ns)
             total_decode_shots += len(obs_det)
-        # Determinism hash updates (after timing window)
+        
+        # Update reproducibility hash
         _hash_update_arr(hasher, errors.astype(np.uint8, copy=False))
         O = check_matrices.observables_matrix.shape[0]
         pred_obs = np.empty((len(obs_det), O), dtype=np.uint8)
         for i, r in enumerate(obs_det):
             pred_obs[i, :] = np.asarray(r.observables, dtype=np.uint8)
         _hash_update_arr(hasher, pred_obs)
+        
+        # Extract iteration statistics
         iters_arr = np.array([r.iterations for r in obs_det], dtype=float)
         iters_i32 = np.fromiter((r.iterations for r in obs_det), dtype=np.int32, count=len(obs_det))
         succ_arr  = np.fromiter((r.converged for r in obs_det), dtype=np.uint8, count=len(obs_det))
@@ -298,13 +373,13 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
         _hash_update_arr(hasher, iters_i32)
         _hash_update_arr(hasher, succ_arr)
         _hash_update_arr(hasher, fail_arr)
-        bp_iters_all.extend(iters_arr.tolist())  # r.iterations = BP iterations
-        # Derive legs only for reporting/debug (not for avg iteration computation)
+        
+        # Track BP iterations (paper's x-axis) and relay legs
+        bp_iters_all.extend(iters_arr.tolist())
         legs_all.extend(1.0 + np.maximum(0.0, (iters_arr - pre_iter) / set_max_iter))
         
-        # Use built-in error_detected flag for counting failures
+        # Count logical errors and provide diagnostic breakdown
         errs = int(sum(r.error_detected for r in obs_det))
-        # Diagnostic breakdown
         n = len(obs_det)
         n_fail = errs
         n_conv = int(sum(r.converged for r in obs_det))
@@ -318,8 +393,8 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
         
         print(f"  Collected {total_shots} shots, {total_errors} errors (batch errors: {errs})")
         
-        # Debug: Show sample predictions vs expected
-        if total_shots <= 2000:  # Only for first batch
+        # Debug output for first batch
+        if total_shots <= 2000:
             print(f"    Sample error_detected: {[r.error_detected for r in obs_det[:3]]}")
             print(f"    Sample iterations: {[r.iterations for r in obs_det[:3]]}")
     
@@ -408,7 +483,14 @@ def run_relay_bp_experiment(circuit, basis, distance, rounds, error_rate, gamma0
 
 
 def run_plain_bp_detailed(args):
-    """Run Plain-BP with detailed iteration counting."""
+    """Run Plain-BP experiment with detailed iteration counting.
+    
+    Args:
+        args: Parsed command line arguments
+        
+    Returns:
+        Dict containing experiment results and statistics
+    """
     return run_plain_bp_experiment(
         circuit=args.circuit,
         basis=args.basis,
@@ -432,11 +514,41 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
                             max_shots=1000000, parallel=True, seed=0,
                             backend: str | None = None, perf: str = "default", algo: str = "plain",
                             dtype: str = 'fp16'):
-    """Run plain min-sum BP (no relay, no memory) with detailed counting."""
+    """Run Plain-BP experiment with detailed iteration counting and performance analysis.
+    
+    This function implements Plain-BP (standard min-sum belief propagation without
+    memory or relay mechanisms) for comparison with Relay-BP performance.
+    
+    Args:
+        circuit: Circuit name/identifier
+        basis: Decoding basis ('z' or 'xz')
+        distance: Code distance
+        rounds: Number of syndrome measurement rounds
+        error_rate: Physical error rate
+        set_max_iter: Maximum BP iterations
+        alpha: Normalized min-sum parameter (None for standard min-sum)
+        target_errors: Target number of logical errors to collect
+        batch: Batch size for error sampling
+        max_shots: Maximum shots to collect
+        parallel: Enable parallel processing
+        seed: Random seed for reproducibility
+        backend: Decoder backend ('rust' or 'triton')
+        perf: Performance mode ('default', 'throughput', 'realtime')
+        algo: Algorithm type ('plain')
+        dtype: Data type ('fp16', 'fp32', 'fp64')
+        
+    Returns:
+        Dict containing comprehensive experiment results including:
+        - Logical error rates (per-shot and per-cycle)
+        - Average BP iterations
+        - Timing metrics (decoder-only and end-to-end)
+        - Determinism hash for reproducibility verification
+    """
 
+    # Initialize deterministic seeding
+    random.seed(seed)
+    np.random.seed(seed)
     try:
-        random.seed(seed)
-        np.random.seed(seed)
         # Stim seeding - try different methods depending on version
         if hasattr(stim, 'set_global_seed'):
             stim.set_global_seed(seed)
@@ -489,10 +601,11 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
     }, sort_keys=True).encode()
     hasher.update(cfg_txt)
 
+    # Create Plain-BP decoder with backend-specific configuration
     if backend == "triton":
-        # Plain BP via Triton degeneracy
-        from relay_bp_triton_adapter import RelayDecoder as _RelayDecoderFXX
-        from relay_bp_triton_adapter import ObservableDecoderRunner as _ObservableDecoderRunner
+        # Plain BP via Triton adapter (degenerate Relay-BP with no memory)
+        from relay_bp_triton.adapter import RelayDecoder as _RelayDecoderFXX
+        from relay_bp_triton.adapter import ObservableDecoderRunner as _ObservableDecoderRunner
         decoder = _RelayDecoderFXX(
             check_matrices.check_matrix,
             error_priors=check_matrices.error_priors,
@@ -517,7 +630,7 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
             include_decode_result=True,
         )
     else:
-        # Rust native MinSum BP (dtype-selected via selector; no fallback)
+        # Rust native MinSum BP decoder
         _RelayDecoderDyn_unused, _RustObservableRunner, _MinSumBPDecoderDyn = _select_backend("rust", dtype, require='plain')
         decoder = _MinSumBPDecoderDyn(
             check_matrices.check_matrix,
@@ -539,13 +652,8 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
     total_decode_ns = 0
     total_decode_shots = 0
 
-    # Untimed warmup via utility: build a fresh fast decoder and run 3 passes
+    # Warmup decoder to avoid JIT/tuning overhead in timing measurements
     from relay_bp_triton.utils import warmup_build_and_decode
-    # Plain-BP warmup parameters: mimic plain degeneracy (no relay legs)
-    _warm_pre_iter = 1
-    _warm_num_sets = 0
-    _warm_set_max_iter = 0
-    _warm_stop_nconv = 1
     warmup_build_and_decode(
         check_matrices=check_matrices,
         dem=dem,
@@ -553,10 +661,10 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
         algo=algo,
         perf=perf,
         dtype=dtype,
-        pre_iter=_warm_pre_iter,
-        num_sets=_warm_num_sets,
-        set_max_iter=_warm_set_max_iter,
-        stop_nconv=_warm_stop_nconv,
+        pre_iter=1,
+        num_sets=0,
+        set_max_iter=0,
+        stop_nconv=1,
         gamma0=None,
         gamma_dist_interval=None,
         alpha=alpha,
@@ -573,10 +681,10 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
     start_time = time.time()
 
     while total_errors < target_errors and total_shots < max_shots:
-        # Use the proper evaluation path: sample errors and use from_errors_decode_observables_detailed_batch
+        # Sample errors and decode with detailed iteration tracking
         det, obs, errors = sampler.sample(batch, return_errors=True)
 
-        # Single detailed decode that provides both iterations and built-in error counting
+        # Decode with timing measurement
         t0_ns = time.perf_counter_ns()
         obs_det = observable_decoder.from_errors_decode_observables_detailed_batch(
             errors.astype(np.uint8), parallel=parallel
@@ -584,13 +692,16 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
         t1_ns = time.perf_counter_ns()
         total_decode_ns += (t1_ns - t0_ns)
         total_decode_shots += len(obs_det)
-        # Determinism hash updates (after timing window)
+        
+        # Update reproducibility hash
         _hash_update_arr(hasher, errors.astype(np.uint8, copy=False))
         O = check_matrices.observables_matrix.shape[0]
         pred_obs = np.empty((len(obs_det), O), dtype=np.uint8)
         for i, r in enumerate(obs_det):
             pred_obs[i, :] = np.asarray(r.observables, dtype=np.uint8)
         _hash_update_arr(hasher, pred_obs)
+        
+        # Extract iteration statistics
         iters_i32 = np.fromiter((r.iterations for r in obs_det), dtype=np.int32, count=len(obs_det))
         succ_arr  = np.fromiter((r.converged for r in obs_det), dtype=np.uint8, count=len(obs_det))
         fail_arr  = np.fromiter((r.error_detected for r in obs_det), dtype=np.uint8, count=len(obs_det))
@@ -600,9 +711,8 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
         iters_arr = np.array([r.iterations for r in obs_det], dtype=float)
         iters_all.extend(iters_arr.tolist())
         
-        # Use built-in error_detected flag for counting failures
+        # Count logical errors and provide diagnostic breakdown
         errs = int(sum(r.error_detected for r in obs_det))
-        # Diagnostic breakdown
         n = len(obs_det)
         n_fail = errs
         n_conv = int(sum(r.converged for r in obs_det))
@@ -674,7 +784,7 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
 
 
 def main():
-    """Main function."""
+    """Main function for Relay-BP detailed analysis script."""
     args = parse_args()
     
     # Print experiment start information

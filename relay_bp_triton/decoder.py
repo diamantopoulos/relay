@@ -8,7 +8,15 @@
 # copyright notice, and modified files need to carry a notice indicating
 # that they have been altered from the originals.
 
-"""Relay-BP-S decoder with Triton GPU kernels."""
+"""Relay-BP-S decoder with Triton GPU kernels.
+
+This module implements the Relay-BP (Relay Belief Propagation) algorithm for quantum error correction
+using GPU-accelerated Triton kernels. The algorithm performs ensemble decoding with disordered memory
+strengths to improve decoding performance on quantum error correction codes.
+
+The implementation closely follows the Rust reference implementation in crates/relay_bp/src/bp/,
+providing GPU acceleration while maintaining algorithmic fidelity.
+"""
 
 import torch
 import numpy as np
@@ -34,6 +42,11 @@ from .utils import (
 )
 @dataclass
 class PerfCfg:
+    """Performance configuration for kernel tuning.
+    
+    Stores autotuned parameters for different performance modes.
+    Corresponds to kernel configuration in the Rust implementation.
+    """
     perf: str
     msg_dtype: str
     check_every: int
@@ -49,6 +62,10 @@ class PerfCfg:
 
 @dataclass
 class RtCfg:
+    """Realtime configuration for persistent kernel mode.
+    
+    Configures the persistent worker kernel for low-latency single-sample decoding.
+    """
     Q: int
     check_every: int
     msg_dtype: str
@@ -60,8 +77,20 @@ class RtCfg:
 class RelayBPDecoder:
     """Relay-BP-S decoder with Triton GPU kernels.
     
-    Implements the Relay-BP algorithm with disordered memory strengths
-    and ensemble decoding for quantum error correction.
+    Implements the Relay-BP (Relay Belief Propagation) algorithm for quantum error correction
+    using GPU-accelerated message passing. The algorithm uses ensemble decoding with disordered
+    memory strengths (gamma mixing) to improve decoding performance on quantum error correction codes.
+    
+    This implementation closely follows the Rust reference in crates/relay_bp/src/bp/relay.rs
+    and crates/relay_bp/src/bp/min_sum.rs, providing GPU acceleration while maintaining
+    algorithmic fidelity to the original min-sum belief propagation with memory.
+    
+    Key features:
+    - Batch processing for multiple syndrome samples
+    - Three performance modes: default, throughput, realtime
+    - Support for both plain BP and Relay-BP algorithms
+    - Configurable min-sum parameters (alpha, beta)
+    - Memory strength (gamma) mixing for ensemble decoding
     """
     
     def __init__(
@@ -87,20 +116,24 @@ class RelayBPDecoder:
         """Initialize Relay-BP decoder.
         
         Args:
-            H_csr: Check matrix (C x V) in CSR format
-            error_priors: [V] error probabilities in (0, 0.5)
-            pre_iter: T0 - iterations for first set
-            num_sets: R - number of relay legs/ensembles
+            H_csr: Check matrix (C x V) in CSR format representing the quantum code's
+                   stabilizer generators. Each row is a check constraint.
+            error_priors: [V] error probabilities in (0, 0.5) for each qubit
+            pre_iter: T0 - iterations for first set (ordered memory phase)
+            num_sets: R - number of relay legs/ensembles (disordered memory phase)
             set_max_iter: Tr - iterations per relay set
-            gamma0: γ for first set (ordered memory)
-            gamma_dist_interval: (min, max) for disordered γ sampling
-            stop_nconv: S - number of solutions to collect
-            normalized_min_sum_alpha: α for normalized min-sum (0 < α ≤ 1)
+            gamma0: γ for first set (ordered memory strength, corresponds to Rust gamma0)
+            gamma_dist_interval: (min, max) for disordered γ sampling in relay legs
+            stop_nconv: S - number of valid solutions to collect before stopping
+            normalized_min_sum_alpha: α for normalized min-sum (0 < α ≤ 1, corresponds to Rust alpha)
             offset_min_sum_beta: β for offset min-sum (mutually exclusive with α)
             dtype_messages: "fp16" or "fp32" for message precision
-            device: "cuda" or "rocm"
-            seed: RNG seed for γ sampling
-            bitpack_output: whether to return packed error bits
+            device: "cuda" or "rocm" for GPU backend
+            seed: RNG seed for γ sampling (corresponds to Rust seed)
+            bitpack_output: whether to return packed error bits for memory efficiency
+            algo: "relay" or "plain" algorithm mode
+            perf: "default", "throughput", or "realtime" performance mode
+            alpha_iteration_scaling_factor: scaling factor for alpha ramp schedule
         """
         # Validate inputs
         validate_csr_matrix(H_csr)
@@ -160,8 +193,8 @@ class RelayBPDecoder:
         log_ratios = compute_log_prior_ratios(error_priors)
         self.lambda0 = torch.from_numpy(log_ratios).to(device).unsqueeze(0)  # [1, V]
         
-        # Precompute weights once (avoid recomputing each loop): match Rust decoding_quality
-        # Use sum of log-priors over bits==1, ignoring infs
+        # Precompute decoding weights for solution selection (matches Rust decoding_quality)
+        # Weight = sum of log-priors for error bits, used to select best solutions
         wj = torch.abs(self.lambda0.squeeze(0)).to(self.device, dtype=torch.float32)  # [V]
         wj = torch.where(torch.isfinite(wj), wj, torch.zeros_like(wj))
         self.wj = wj.contiguous()
@@ -176,7 +209,7 @@ class RelayBPDecoder:
         else:
             raise ValueError("dtype_messages must be 'fp16' or 'fp32'")
         
-        # Centralize perf config
+        # Performance configuration (fallback values, overridden by autotuning)
         self.cfg = PerfCfg(
             perf=self.perf,
             msg_dtype=self.dtype_messages,
@@ -207,7 +240,7 @@ class RelayBPDecoder:
             block_size=int(os.getenv("RELAY_RT_BLOCK_SIZE", "128")),
         )
         self._rt_worker_launched = False
-        # Optional logging for cached tuning usage (lightweight, guarded)
+        # Optional logging for cached tuning usage
         self._tune_log = os.getenv("RELAY_TUNE_VERBOSE", "0") == "1"
         self._tune_logged: set[str] = set()
     
@@ -841,21 +874,18 @@ class RelayBPDecoder:
         
         # Initialize messages
         self._launch_init_kernel(tensors, B)
-        # TODO
-        #tensors['mu'].zero_()
-        #tensors['nu'].zero_()
 
-        # Pre-iterations (T0) with uniform gamma0
+        # Pre-iterations (T0) with uniform gamma0 (ordered memory phase)
         if self.algo == "plain" or self.num_sets == 0:
-            # Plain BP: no posterior mixing; λ must remain λ₀ each iter
+            # Plain BP: no memory mixing; λ remains λ₀ each iteration
             tensors['gamma'].fill_(0.0)
         else:
-            # Relay BP: use γ-mixing
+            # Relay BP: use γ-mixing for ordered memory
             gamma0_tensor = sample_gamma_scalar(B, self.V, self.gamma0, self.device)
             tensors['gamma'][:] = gamma0_tensor
         
         if self.cfg.perf == "throughput":
-            # transpose mu/nu to [E,B] once
+            # Transpose message tensors to [E,B] layout for throughput optimization
             self._be_to_eb(tensors['mu'], tensors['muT'], B)
             self._be_to_eb(tensors['nu'], tensors['nuT'], B)
 
@@ -872,7 +902,7 @@ class RelayBPDecoder:
                     self._alpha_current = 1.0
                 else:
                     self._alpha_current = a
-            # Build active lane compaction for efficiency (reused for parity)
+            # Build active lane compaction for efficiency
             active_idx = torch.nonzero(tensors['active'] != 0, as_tuple=False).squeeze(1).to(torch.int32)
             B_active = int(active_idx.numel())
             
@@ -975,7 +1005,7 @@ class RelayBPDecoder:
                 
                 # Check parity and select solutions only every CHECK_EVERY iterations
                 if (t + 1) % self.cfg.check_every == 0:
-                    # Build active lane compaction for efficiency (reused for parity)
+                    # Build active lane compaction for efficiency
                     active_idx = torch.nonzero(tensors['active'] != 0, as_tuple=False).squeeze(1).to(torch.int32)
                     B_active = int(active_idx.numel())
                     self._check_parity_and_select(tensors, B, active_idx, B_active)
@@ -993,7 +1023,7 @@ class RelayBPDecoder:
                         break
             
             # Final parity check after the leg
-            # Build active lane compaction for efficiency (reused for parity)
+            # Build active lane compaction for efficiency
             active_idx = torch.nonzero(tensors['active'] != 0, as_tuple=False).squeeze(1).to(torch.int32)
             B_active = int(active_idx.numel())
             

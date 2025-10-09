@@ -8,7 +8,16 @@
 # copyright notice, and modified files need to carry a notice indicating
 # that they have been altered from the originals.
 
-"""Graph utilities for converting SciPy CSR matrices to device-optimized edge-centric representation."""
+"""Graph utilities for converting SciPy CSR matrices to device-optimized edge-centric representation.
+
+This module provides utilities for converting quantum error correction check matrices
+from SciPy sparse format to GPU-optimized representations for belief propagation.
+The CSRGraph class builds edge-centric data structures that enable efficient
+message passing on GPU hardware.
+
+The implementation follows the sparse graph representation used in the Rust
+implementation in crates/relay_bp/src/bipartite_graph.rs.
+"""
 
 import torch
 import numpy as np
@@ -18,7 +27,26 @@ from typing import Tuple, Optional
 from scipy.sparse import csr_matrix, issparse
 
 class CSRGraph:
+    """GPU-optimized representation of quantum error correction check matrix.
+    
+    This class converts a SciPy CSR matrix representing quantum stabilizer generators
+    into GPU-optimized edge-centric data structures for belief propagation.
+    
+    The representation includes:
+    - Check-centric view: chk_ptr, chk_edges for check-to-variable message passing
+    - Variable-centric view: var_ptr, var_edges for variable-to-check message passing
+    - Edge mappings: edge_var, edge_chk for edge-to-node lookups
+    
+    This follows the sparse bipartite graph representation in Rust bipartite_graph.rs.
+    """
+    
     def __init__(self, H_csr: csr_matrix, device: str = "cuda"):
+        """Initialize CSRGraph from quantum check matrix.
+        
+        Args:
+            H_csr: Check matrix (C x V) in CSR format representing stabilizer generators
+            device: Target GPU device ("cuda" or "rocm")
+        """
         if device == "cpu":
             raise RuntimeError("CPU not supported - Triton kernels require GPU. Use device='cuda' or 'rocm'")
 
@@ -44,7 +72,12 @@ class CSRGraph:
         self._build_edge_representation(H_csr)
     
     def _build_edge_representation(self, H_csr: csr_matrix):
-        """Build edge-centric representation from CSR matrix."""
+        """Build edge-centric representation from CSR matrix.
+        
+        This method constructs the GPU-optimized data structures needed for
+        belief propagation message passing, following the sparse graph format
+        used in the Rust implementation.
+        """
         # Get CSR data
         chk_ptr = H_csr.indptr.astype(np.int32)
         chk_edges = H_csr.indices.astype(np.int32)  # These are variable indices
