@@ -45,27 +45,25 @@ class RelayDecoder:
 
         self.N = int(self.H_csr.shape[1])
         _plain = (num_sets == 0)
-        _gamma0 = 0.0 if _plain else gamma0
         _gamma_interval = (0.0, 0.0) if _plain else tuple(gamma_dist_interval)
-        _alpha = alpha if (alpha is not None) else (None if _plain else 0.0)
-        _beta  = beta  if (beta  is not None) else (None if _plain else None)
+
 
         self._dec = TritonDecoder(
             self.H_csr,
             error_priors=error_priors,
             pre_iter=pre_iter,
-            num_sets=(0 if _plain else num_sets),
-            set_max_iter=(0 if _plain else set_max_iter),
-            gamma0=_gamma0,
+            num_sets=num_sets,
+            set_max_iter=set_max_iter,
+            gamma0=gamma0,
             gamma_dist_interval=_gamma_interval,
-            stop_nconv=(1 if _plain else stop_nconv),
-            normalized_min_sum_alpha=_alpha,
-            offset_min_sum_beta=_beta,
+            stop_nconv=stop_nconv,
+            normalized_min_sum_alpha=alpha,
+            offset_min_sum_beta=beta,
             dtype_messages=dtype_messages,
             device=device,
-            seed=int(seed or 0),
+            seed=seed,
             bitpack_output=bitpack_output,
-            algo=(algo or ("plain" if _plain else "relay")),
+            algo=algo,
             perf=perf,
             alpha_iteration_scaling_factor=alpha_iteration_scaling_factor,
         )

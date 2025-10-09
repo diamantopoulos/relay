@@ -429,6 +429,85 @@ def zero_check_ok_inactive_kernel(
 
     tl.store(check_ok + bb * C + cc, 0, mask=mask2d)
 
+
+@triton.jit
+def check_and_select_kernel(
+    check_ok,              # [B,C] uint8
+    M,                     # [B,V] fp32 (may be unused if USE_M==0)
+    hard_dec,              # [B,V] uint8
+    wj,                    # [V] fp32
+    best_weights,          # [B] fp32 (in/out)
+    best_errors,           # [B,V] uint8 (out when improved)
+    valid_solutions,       # [B] uint8 (out flag)
+    found_count,           # [B] int32 (in/out)
+    B, C, V,
+    USE_M: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    """Reduce check_ok per lane and update best solution fully on device.
+
+    If all checks pass for lane b, compute current hard decisions and weight, then
+    atomically update best_weights/best_errors/valid_solutions when improved.
+    """
+    b = tl.program_id(axis=0)
+    if b >= B:
+        return
+
+    # 1) all_ok = all(check_ok[b, :])
+    all_ok = tl.full((), 1, dtype=tl.int32)
+    c0 = 0
+    while c0 < C:
+        cc = c0 + tl.arange(0, BLOCK_C)
+        mc = cc < C
+        vals = tl.load(check_ok + b * C + cc, mask=mc, other=0).to(tl.int32)
+        # if any zero present in this tile, min will be 0
+        tile_all = tl.min(tl.where(mc, vals, 1), axis=0)
+        all_ok = tl.minimum(all_ok, tile_all)
+        c0 += BLOCK_C
+
+    if all_ok == 0:
+        return
+
+    # 2) compute current hard decisions and weight
+    weight = tl.zeros((), dtype=tl.float32)
+    v0 = 0
+    while v0 < V:
+        vv = v0 + tl.arange(0, BLOCK_V)
+        mv = vv < V
+        if USE_M:
+            Mv = tl.load(M + b * V + vv, mask=mv, other=0.0)
+            bits = (Mv < 0.0).to(tl.uint8)
+        else:
+            bits = tl.load(hard_dec + b * V + vv, mask=mv, other=0)
+        wtile = tl.load(wj + vv, mask=mv, other=0.0)
+        weight += tl.sum(wtile * bits.to(tl.float32), axis=0)
+        v0 += BLOCK_V
+
+    # 3) compare-and-update best
+    prev_best = tl.load(best_weights + b)
+    better = weight < prev_best
+    if better:
+        tl.store(best_weights + b, weight)
+        prev_valid = tl.load(valid_solutions + b)
+        # write best_errors row
+        off = 0
+        while off < V:
+            vv = off + tl.arange(0, BLOCK_V)
+            mv = vv < V
+            if USE_M:
+                Mv2 = tl.load(M + b * V + vv, mask=mv, other=0.0)
+                bits2 = (Mv2 < 0.0).to(tl.uint8)
+            else:
+                bits2 = tl.load(hard_dec + b * V + vv, mask=mv, other=0)
+            tl.store(best_errors + b * V + vv, bits2, mask=mv)
+            off += BLOCK_V
+        # mark valid
+        tl.store(valid_solutions + b, 1)
+        if prev_valid == 0:
+            old = tl.load(found_count + b)
+            tl.store(found_count + b, old + 1)
+
 @triton.jit
 def init_messages_kernel(
     mu, nu,

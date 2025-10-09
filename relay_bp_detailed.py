@@ -506,9 +506,10 @@ def run_plain_bp_experiment(circuit, basis, distance, rounds, error_rate,
             algo=algo,
             perf=perf,
             dtype_messages=('fp16' if dtype == 'fp16' else 'fp32'),
-            alpha=(None if (alpha is None or alpha == 0.0) else float(alpha)),
+            alpha=alpha,
             beta=None,
             device="cuda",
+            seed=seed,
         )
         observable_decoder = _ObservableDecoderRunner(
             decoder,

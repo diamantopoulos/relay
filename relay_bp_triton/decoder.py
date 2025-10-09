@@ -74,7 +74,7 @@ class RelayBPDecoder:
         gamma0: float = 0.65,
         gamma_dist_interval: Tuple[float, float] = (-0.24, 0.66),
         stop_nconv: int = 5,
-        normalized_min_sum_alpha: Optional[float] = 0.90,
+        normalized_min_sum_alpha: Optional[float] = None,
         offset_min_sum_beta: Optional[float] = None,
         dtype_messages: str = "fp16",
         device: str = "cuda",
@@ -237,7 +237,7 @@ class RelayBPDecoder:
             'best_weights': torch.full((B,), float('inf'), dtype=torch.float32, device=self.device),
             'best_errors': torch.zeros(B, self.V, dtype=torch.uint8, device=self.device),
             'found_count': torch.zeros(B, dtype=torch.int32, device=self.device),
-            'valid_solutions': torch.zeros(B, dtype=torch.bool, device=self.device),
+            'valid_solutions': torch.zeros(B, dtype=torch.uint8, device=self.device),
             
         }
         if self.cfg.perf == "throughput":
@@ -751,8 +751,9 @@ class RelayBPDecoder:
             BLOCK_B=BLOCK_B, BLOCK_C=BLOCK_C,
         )
     
+    
     def _check_parity_and_select(self, tensors: Dict, B: int, active_idx: torch.Tensor = None, B_active: int = None):
-        """Check parity and select best solutions (device-only, no return)."""
+        """Check parity and select best solutions fully on device (no host reductions)."""
         # Launch the right parity kernel
         if self.cfg.perf == "throughput":
             # parity over hard_dec (since M may not be stored)
@@ -767,33 +768,28 @@ class RelayBPDecoder:
         else:
             # parity over M
             self._launch_parity_check_kernel(tensors, B)
-        
-        # Check if all parity constraints are satisfied
-        valid = tensors['check_ok'].view(B, self.C).all(dim=1)  # [B] bool
-        idx = torch.nonzero(valid, as_tuple=False).squeeze(1)  # [K]
-        # Snapshot previous validity BEFORE mutating valid_solutions
-        prev_valid = tensors['valid_solutions'].clone()
 
-        if idx.numel() > 0:
-            # Only compute weights for valid indices; derive current hard decisions
-            if self.cfg.perf == "throughput":
-                # In throughput mode, use hard_dec directly (M is not stored)
-                curr_hd = tensors['hard_dec'][idx]
-            else:
-                # In default mode, derive from M
-                curr_hd = (tensors['M'][idx] < 0).to(torch.uint8)
-            cand_w = (curr_hd.float() * self.wj).sum(dim=1)  # [K]
+        # Device-side select: avoid host-side all/nonzero/weight compute
+        from .kernels import check_and_select_kernel
+        USE_M = int(self.cfg.perf != "throughput")
+        BLOCK_C = 256
+        BLOCK_V = 128
+        check_and_select_kernel[(B,)](
+            tensors['check_ok'],
+            tensors['M'],
+            tensors['hard_dec'],
+            self.wj,
+            tensors['best_weights'],
+            tensors['best_errors'],
+            tensors['valid_solutions'],
+            tensors['found_count'],
+            B, self.C, self.V,
+            USE_M=USE_M,
+            BLOCK_C=BLOCK_C,
+            BLOCK_V=BLOCK_V,
+        )
 
-            better = cand_w < tensors['best_weights'][idx]
-            if better.any():
-                upd = idx[better]
-                tensors['best_weights'][upd] = cand_w[better]
-                tensors['best_errors'][upd] = curr_hd[better]
-                tensors['valid_solutions'][upd] = True
-
-        # Count newly found lanes (Rust-like) using the snapshot
-        newly_found = valid & ~prev_valid
-        tensors['found_count'] += newly_found.to(torch.int32)
+        # Device-side selection already updates found_count and valid_solutions; no host-side counting needed.
     
     def decode(self, syndromes: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Decode syndromes using Relay-BP algorithm.
@@ -850,8 +846,13 @@ class RelayBPDecoder:
         #tensors['nu'].zero_()
 
         # Pre-iterations (T0) with uniform gamma0
-        gamma0_tensor = sample_gamma_scalar(B, self.V, self.gamma0, self.device)
-        tensors['gamma'][:] = gamma0_tensor
+        if self.algo == "plain" or self.num_sets == 0:
+            # Plain BP: no posterior mixing; λ must remain λ₀ each iter
+            tensors['gamma'].fill_(0.0)
+        else:
+            # Relay BP: use γ-mixing
+            gamma0_tensor = sample_gamma_scalar(B, self.V, self.gamma0, self.device)
+            tensors['gamma'][:] = gamma0_tensor
         
         if self.cfg.perf == "throughput":
             # transpose mu/nu to [E,B] once
@@ -892,7 +893,7 @@ class RelayBPDecoder:
             if (t + 1) % self.cfg.check_every == 0:
                 # For parity path, we need hard_dec updated (done in v2c btile when write_hard=True)
                 self._check_parity_and_select(tensors, B, active_idx, B_active)
-                # Device-side freeze + first-iter capture and bump iter counter
+                # Device-side freeze + first-iter capture
                 freeze_finished_lanes_kernel[(B,)](
                     tensors['best_errors'],
                     tensors['hard_dec'], tensors['gamma'], tensors['active'],
@@ -932,7 +933,7 @@ class RelayBPDecoder:
         )
         if tensors['all_done_flag'].item():
             fallback_errors = torch.where(
-                tensors['valid_solutions'].view(-1, 1),
+                tensors['valid_solutions'].view(-1, 1).to(torch.bool),
                 tensors['best_errors'],
                 tensors['hard_dec'],
             )
@@ -1016,7 +1017,7 @@ class RelayBPDecoder:
         # Prepare output
         # Fallback: if no valid solution was found for a batch item, use the last hard decision
         fallback_errors = torch.where(
-            tensors['valid_solutions'].view(-1, 1),
+            tensors['valid_solutions'].view(-1, 1).to(torch.bool),
             tensors['best_errors'],
             tensors['hard_dec'],
         )
@@ -1026,13 +1027,18 @@ class RelayBPDecoder:
             errors = fallback_errors
         
         # Build per-lane iteration counts (Rust-like): first_iter if set, else total iter_counter
+        total_iters_scalar = int(tensors['iter_counter'].item())
         iters = tensors['first_iter'].clone()
-        iters = torch.where(iters >= 0, iters, tensors['iter_counter'].expand_as(iters))
+        iters = torch.where(
+            iters >= 0,
+            iters,
+            torch.full_like(iters, total_iters_scalar)
+        )
 
         return {
             "errors": errors,
             "weights": tensors['best_weights'],
-            "valid_mask": tensors['valid_solutions'],
+            "valid_mask": tensors['valid_solutions'].to(torch.bool),
             "iterations": iters,
         }
     
