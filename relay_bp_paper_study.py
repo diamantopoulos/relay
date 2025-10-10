@@ -125,19 +125,19 @@ class RelayBPPaperStudy:
         """
         configs: List[Dict[str, Any]] = []
         backends = ['rust', 'triton']
-        batch_values = [1]  # Single batch for detailed analysis
+        batch_values = [100, 1000, 10000]  # Single batch for detailed analysis
+        dtypes = ['fp32']
 
         # Plain BP sweep: vary max iterations to generate performance curves
-        set_max_iter_values = [1, 5, 10, 20, 40, 60, 80, 100, 200, 300, 500, 600, 700, 1000, 1500, 2000, 5000, 10000]
+        set_max_iter_values = [10, 20, 40, 60, 80, 100] #, 200, 300, 500, 600, 700, 1000, 1500, 2000, 5000, 10000]
         for backend in backends:
-            dtypes = ['fp32']  # Focus on fp32 for consistency
             for dtype in dtypes:
                 for tmax in set_max_iter_values:
                     for batch in batch_values:
                         configs.append({
                             'name': f'PlainBP-maxiter{tmax}-B{batch}-{backend}-{dtype}',
                             'algo': 'plain',
-                            'perf': 'throughput',
+                            'perf': 'default',
                             'backend': backend,
                             'dtype': dtype,
                             'batch': batch,
@@ -146,24 +146,27 @@ class RelayBPPaperStudy:
                         })
 
         # Relay-BP sweep: S (stop_nconv) and R (num_sets) parameter grid
-        # Uncomment to enable Relay-BP parameter sweeps
-        # stop_nconv_values = [1, 2, 3, 5, 7, 9]
-        # num_sets_values = [1, 3, 5, 9, 13, 21, 45]
-        # for backend in backends:
-        #     for s in stop_nconv_values:
-        #         for r in num_sets_values:
-        #             configs.append({
-        #                 'name': f'Relay-BP-S{s}-R{r}-{backend}',
-        #                 'algo': 'relay',
-        #                 'perf': ('throughput' if backend == 'triton' else 'default'),
-        #                 'backend': backend,
-        #                 'num_sets': r,
-        #                 'gamma0': 0.125,
-        #                 'gamma_dist_interval': (-0.24, 0.66),
-        #                 'pre_iter': 80,
-        #                 'set_max_iter': 60,
-        #                 'stop_nconv': s,
-        #             })
+        stop_nconv_values = [1] #, 2, 3, 5, 7, 9]
+        num_sets_values = [1, 100] #, 3, 5, 9, 13, 21, 45]
+        for backend in backends:
+            for dtype in dtypes:
+                for s in stop_nconv_values:
+                    for r in num_sets_values:
+                        for tmax in set_max_iter_values:
+                            for batch in batch_values:
+                                configs.append({
+                                    'name': f'Relay-BP-S{s}-B{batch}-maxiter{tmax}-R{r}-{backend}-{dtype}',
+                                    'algo': 'relay',
+                                    'perf': 'default',
+                                    'backend': backend,
+                                    'batch': batch,
+                                    'num_sets': r,
+                                    'gamma0': 0.125,
+                                    'gamma_dist_interval': (-0.24, 0.66),
+                                    'pre_iter': 80,
+                                    'set_max_iter': tmax,
+                                    'stop_nconv': s,
+                                })
 
         return configs
 
@@ -204,7 +207,7 @@ class RelayBPPaperStudy:
                     alpha=config.get('alpha', None),
                     target_errors=20,
                     batch=config.get('batch', 2048),
-                    max_shots=1,
+                    max_shots=100_000,
                     parallel=True,
                     seed=0,
                     backend=backend,
