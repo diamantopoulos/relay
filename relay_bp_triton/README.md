@@ -57,6 +57,7 @@ decoder = RelayBPDecoder(
     gamma0=0.65,                    # γ₀: ordered memory strength
     gamma_dist_interval=(-0.24, 0.66),  # Disordered γ sampling range
     stop_nconv=5,                   # S: number of solutions to collect
+    stopping_criterion="nconv",    # "nconv" | "pre_iter" | "all"
     dtype_messages="fp16",          # Message precision
     device="cuda"
 )
@@ -87,7 +88,8 @@ decoder = RelayDecoder(
     num_sets=100,
     set_max_iter=60,
     gamma_dist_interval=(-0.24, 0.66),
-    stop_nconv=5
+    stop_nconv=5,
+    stopping_criterion="nconv"
 )
 
 # Decode single syndrome
@@ -118,6 +120,7 @@ Main decoder class implementing the Relay-BP-S algorithm with GPU acceleration.
 - `gamma0`: γ₀ - ordered memory strength for first set (default: 0.65)
 - `gamma_dist_interval`: (min, max) for disordered γ sampling in relay legs (default: (-0.24, 0.66))
 - `stop_nconv`: S - number of valid solutions to collect before stopping (default: 5)
+- `stopping_criterion`: "nconv" (default), "pre_iter", or "all" to control early stopping
 - `normalized_min_sum_alpha`: α for normalized min-sum (0 < α ≤ 1, default: 1.0)
 - `offset_min_sum_beta`: β for offset min-sum (mutually exclusive with α)
 - `dtype_messages`: "fp16" or "fp32" for message precision (default: "fp16")
@@ -126,6 +129,7 @@ Main decoder class implementing the Relay-BP-S algorithm with GPU acceleration.
 - `bitpack_output`: whether to return packed error bits for memory efficiency (default: False)
 - `algo`: "relay" or "plain" algorithm mode (default: "relay")
 - `perf`: "default", "throughput", or "realtime" performance mode (default: "default")
+- `explicit_gammas`: optional array of shape (K, V) providing per-leg, per-variable γ values; if set, leg `l` uses row `l % K` instead of uniform sampling
 
 **Methods:**
 - `decode(syndromes)`: Decode batch of syndromes
@@ -171,7 +175,7 @@ Shares ensemble posteriors to accelerate convergence, using information from pre
 
 1. **Pre-iterations (T₀)**: Run belief propagation with uniform memory strength γ₀
 2. **Relay legs (R times)**:
-   - Sample disordered γ values from uniform distribution
+   - Use explicit γ per leg if provided, else sample disordered γ values from a uniform distribution
    - Run belief propagation for Tᵣ iterations with memory mixing
    - Track best solutions (up to S solutions)
 3. **Solution selection**: Return solution with minimum log-likelihood weight

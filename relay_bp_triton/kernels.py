@@ -246,7 +246,8 @@ def v2c_and_marginals_fused_gamma_kernel(
                 M_bj_curr = lam_bj + sum_nu
                 if STORE_M:
                     tl.store(M + b*V + j, M_bj_curr)  # Only store if needed
-                tl.store(hard_dec + b*V + j, (M_bj_curr < 0.0).to(tl.uint8))
+                # Match Rust convergence rule Bit::from(posterior <= 0)
+                tl.store(hard_dec + b*V + j, (M_bj_curr <= 0.0).to(tl.uint8))
 
                 # FUSED GAMMA MIXING: λ = (1-γ)*λ₀ + γ*M (memory-based belief update)
                 g_bj = tl.load(gamma + b*V + j)           # [B,V]
@@ -254,14 +255,15 @@ def v2c_and_marginals_fused_gamma_kernel(
                 lam_bj_new = (1.0 - g_bj) * lam0_j + g_bj * M_bj_curr
                 tl.store(lam + b*V + j, lam_bj_new)
 
-                # PASS 2: Write outgoing messages using updated beliefs (vectorized)
+                # PASS 2: Write outgoing messages using previous iteration beliefs
                 tile = row_start
                 while tile < row_end:
                     offs = tile + tl.arange(0, BLOCK_SIZE)
                     m    = offs < row_end
                     e    = tl.load(var_edges + offs, mask=m, other=0)
                     nu_e = tl.load(nu + b*E + e,     mask=m, other=0.0)
-                    mu_e = lam_bj_new + (sum_nu - nu_e.to(tl.float32))  # Convert to fp32 for computation
+                    # Use lam_bj (previous iteration mixed belief) to compute mu, matching Rust schedule
+                    mu_e = lam_bj + (sum_nu - nu_e.to(tl.float32))  # Convert to fp32 for computation
                     if msg_is_fp16:
                         tl.store(mu + b*E + e, mu_e.to(tl.float16), mask=m)
                     else:
@@ -932,13 +934,14 @@ def v2c_and_gamma_btile_kernel(
         tl.store(M + bs * V + j, M_bj, mask=mb)
     # Optionally update hard_dec if requested (to avoid bandwidth in hot path)
     if WRITE_HARD:
-        tl.store(hard_dec + bs * V + j, (M_bj < 0.0).to(tl.uint8), mask=mb)
+        # Match Rust convergence rule Bit::from(posterior <= 0)
+        tl.store(hard_dec + bs * V + j, (M_bj <= 0.0).to(tl.uint8), mask=mb)
     g_bj = tl.load(gamma + bs * V + j, mask=mb, other=0.0)
     lam0_j = tl.load(lam0 + j)
     lam_new = (1.0 - g_bj) * lam0_j + g_bj * M_bj
     tl.store(lam + bs * V + j, lam_new, mask=mb)
 
-    # write muT for each edge lane (vectorized)
+    # write muT for each edge lane (vectorized) using previous iteration beliefs
     tile = row_start
     while tile < row_end:
         offs = tile + tl.arange(0, BLOCK_SIZE)
@@ -946,7 +949,8 @@ def v2c_and_gamma_btile_kernel(
         evec = tl.load(var_edges + offs, mask=mrow, other=0)
         mask2d = (mrow[:, None]) & (mb[None, :])
         nu_tile = tl.load(nuT + (evec[:, None]) * B + bs[None, :], mask=mask2d, other=0.0)
-        mu_tile = lam_new[None, :] + (sum_nu[None, :] - nu_tile.to(tl.float32))
+        # Use lam_bj (previous iteration mixed belief) to compute mu, matching Rust schedule
+        mu_tile = lam_bj[None, :] + (sum_nu[None, :] - nu_tile.to(tl.float32))
         if msg_is_fp16:
             tl.store(muT + (evec[:, None]) * B + bs[None, :], mu_tile.to(tl.float16), mask=mask2d)
         else:

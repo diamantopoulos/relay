@@ -61,6 +61,7 @@ class RelayDecoder:
                  perf: Optional[str] = None,
                  alpha_iteration_scaling_factor: float = 1.0,
                  bitpack_output: bool = False,
+                 explicit_gammas: Optional[np.ndarray] = None,
                  **kwargs):
         # Convert input to CSR matrix format (handles various sparse matrix types)
         if sp is not None:
@@ -95,6 +96,8 @@ class RelayDecoder:
             algo=algo,
             perf=perf,
             alpha_iteration_scaling_factor=alpha_iteration_scaling_factor,
+            stopping_criterion=stopping_criterion,
+            explicit_gammas=explicit_gammas,
         )
 
 
@@ -126,6 +129,69 @@ class RelayDecoder:
             "iterations": iters,
             "selected_idx": 0,
         }
+
+    def decode_detailed(self, detectors: np.ndarray | torch.Tensor):
+        """Decode detectors with detailed results (matches Rust interface).
+        
+        Args:
+            detectors: Detector vector as numpy array or torch tensor
+            
+        Returns:
+            DecodeResult object with detailed decoding information
+        """
+        result = self.decode(detectors)
+        return _ObsResult(
+            iterations=result["iterations"],
+            converged=result["converged"],
+            error_detected=not result["converged"],  # Error detected if not converged
+            observables=result["bits"].cpu().numpy(),  # Use bits as observables for now
+        )
+
+    def decode_batch(self, detectors: np.ndarray | torch.Tensor):
+        """Decode batch of detectors (matches Rust interface).
+        
+        Args:
+            detectors: Batch of detector vectors as numpy array or torch tensor
+            
+        Returns:
+            Batch of decoded error vectors as numpy array
+        """
+        if isinstance(detectors, np.ndarray):
+            detectors = torch.from_numpy(detectors.astype(np.uint8, copy=False)).to(self._dec.device)
+        else:
+            detectors = detectors.to(self._dec.device, dtype=torch.uint8)
+        
+        out = self._dec.decode(detectors)
+        return out["errors"].to(torch.int8).cpu().numpy()
+
+    def decode_detailed_batch(self, detectors: np.ndarray | torch.Tensor):
+        """Decode batch of detectors with detailed results (matches Rust interface).
+        
+        Args:
+            detectors: Batch of detector vectors as numpy array or torch tensor
+            
+        Returns:
+            List of DecodeResult objects with detailed decoding information
+        """
+        if isinstance(detectors, np.ndarray):
+            detectors = torch.from_numpy(detectors.astype(np.uint8, copy=False)).to(self._dec.device)
+        else:
+            detectors = detectors.to(self._dec.device, dtype=torch.uint8)
+        
+        out = self._dec.decode(detectors)
+        results = []
+        for i in range(detectors.shape[0]):
+            bits = out["errors"][i].to(torch.int8)
+            converged = bool(out["valid_mask"][i].item())
+            iters = int(out.get("iterations", torch.tensor([self._dec.pre_iter], device=self._dec.device))[i].item())
+            
+            results.append(_ObsResult(
+                iterations=iters,
+                converged=converged,
+                error_detected=not converged,  # Error detected if not converged
+                observables=bits.cpu().numpy(),  # Use bits as observables for now
+            ))
+        return results
 
 
 class ObservableDecoderRunner:

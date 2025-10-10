@@ -91,6 +91,8 @@ class RelayBPDecoder:
     - Support for both plain BP and Relay-BP algorithms
     - Configurable min-sum parameters (alpha, beta)
     - Memory strength (gamma) mixing for ensemble decoding
+    - Stopping criteria control ("nconv", "pre_iter", "all")
+    - Optional explicit per-leg gamma matrices (K×V) for deterministic relay legs
     """
     
     def __init__(
@@ -112,6 +114,8 @@ class RelayBPDecoder:
         algo: Optional[str] = None,           # "relay" or "plain"
         perf: Optional[str] = None,           # "default" | "throughput" | "realtime"
         alpha_iteration_scaling_factor: Optional[float] = 1.0,
+        stopping_criterion: Optional[str] = None,  # "nconv" | "pre_iter" | "all"
+        explicit_gammas: Optional[np.ndarray] = None,
     ):
         """Initialize Relay-BP decoder.
         
@@ -134,6 +138,11 @@ class RelayBPDecoder:
             algo: "relay" or "plain" algorithm mode
             perf: "default", "throughput", or "realtime" performance mode
             alpha_iteration_scaling_factor: scaling factor for alpha ramp schedule
+            stopping_criterion: one of {"nconv", "pre_iter", "all"}. If "pre_iter", the decoder
+                returns immediately after pre-iterations upon any valid solution. If "all", the
+                decoder will not early-out during relay legs based on NConv and will execute all legs.
+            explicit_gammas: optional np.ndarray of shape (K, V) providing per-leg, per-variable
+                memory strengths γ. Leg l uses row (l % K). When provided, uniform γ sampling is disabled.
         """
         # Validate inputs
         validate_csr_matrix(H_csr)
@@ -176,6 +185,19 @@ class RelayBPDecoder:
             raise ValueError(f"Unknown perf '{perf_norm}'. Use 'default'/'throughput'/'realtime'.")
         self.perf = perf_aliases[perf_norm]
         self.alpha_iteration_scaling_factor = float(alpha_iteration_scaling_factor or 1.0)
+        # Stopping criterion: controls early-out behavior
+        sc = (stopping_criterion or "nconv").strip().lower()
+        if sc not in ("nconv", "pre_iter", "all"):
+            raise ValueError("stopping_criterion must be one of 'nconv','pre_iter','all'")
+        self.stopping_criterion = sc
+        # Explicit gammas (for relay legs only). Stored once on device as [K,V] fp32.
+        self.explicit_gammas = None
+        if explicit_gammas is not None:
+            eg = np.asarray(explicit_gammas, dtype=np.float32)
+            if eg.ndim != 2 or eg.shape[1] != int(H_csr.shape[1]):
+                raise ValueError(f"explicit_gammas must have shape (K, V={int(H_csr.shape[1])})")
+            # store on device as [K,V] fp32
+            self.explicit_gammas = torch.from_numpy(eg).to(device=torch.device(device), dtype=torch.float32)
         
         # Set up device
         if device == "cuda" and not torch.cuda.is_available():
@@ -785,10 +807,18 @@ class RelayBPDecoder:
         )
     
     
-    def _check_parity_and_select(self, tensors: Dict, B: int, active_idx: torch.Tensor = None, B_active: int = None):
-        """Check parity and select best solutions fully on device (no host reductions)."""
+    def _check_parity_and_select(self, tensors: Dict, B: int, active_idx: torch.Tensor = None, B_active: int = None, *, force_hard: bool = False):
+        """Check parity and select best solutions fully on device (no host reductions).
+        
+        Args:
+            tensors: device tensors dict
+            B: batch size
+            active_idx: optional compact active indices
+            B_active: number of active lanes
+            force_hard: if True, use hard_dec parity path regardless of perf mode
+        """
         # Launch the right parity kernel
-        if self.cfg.perf == "throughput":
+        if self.cfg.perf == "throughput" or force_hard:
             # parity over hard_dec (since M may not be stored)
             if active_idx is not None and B_active is not None and B_active > 0:
                 # Zero out check_ok for inactive lanes first
@@ -804,7 +834,7 @@ class RelayBPDecoder:
 
         # Device-side select: avoid host-side all/nonzero/weight compute
         from .kernels import check_and_select_kernel
-        USE_M = int(self.cfg.perf != "throughput")
+        USE_M = int((self.cfg.perf != "throughput") and (not force_hard))
         BLOCK_C = 256
         BLOCK_V = 128
         check_and_select_kernel[(B,)](
@@ -835,6 +865,8 @@ class RelayBPDecoder:
                 - "errors": [B, V] decoded errors (uint8) or packed if bitpack_output=True
                 - "weights": [B] solution weights (float32)
                 - "valid_mask": [B] valid solution mask (bool)
+                - "iterations": [B] iteration counts; respects early-out for "pre_iter" and
+                  avoids early-out for "all" (runs all legs)
         """
         B = syndromes.shape[0]
         
@@ -922,7 +954,8 @@ class RelayBPDecoder:
 
             if (t + 1) % self.cfg.check_every == 0:
                 # For parity path, we need hard_dec updated (done in v2c btile when write_hard=True)
-                self._check_parity_and_select(tensors, B, active_idx, B_active)
+                # Use hard_dec parity during pre-iterations for Rust-compat convergence
+                self._check_parity_and_select(tensors, B, active_idx, B_active, force_hard=True)
                 # Device-side freeze + first-iter capture
                 freeze_finished_lanes_kernel[(B,)](
                     tensors['best_errors'],
@@ -961,7 +994,7 @@ class RelayBPDecoder:
         reduce_all_ge_kernel[(1,)](
             tensors['found_count'], self.stop_nconv, tensors['all_done_flag'], B
         )
-        if tensors['all_done_flag'].item():
+        if tensors['all_done_flag'].item() and self.stopping_criterion != "all":
             fallback_errors = torch.where(
                 tensors['valid_solutions'].view(-1, 1).to(torch.bool),
                 tensors['best_errors'],
@@ -979,13 +1012,45 @@ class RelayBPDecoder:
                 "valid_mask": tensors['valid_solutions'],
                 "iterations": iters,
             }
+
+        # If stopping_criterion requests PRE_ITER early return on any success
+        # If requested, honor PRE_ITER stopping: return immediately upon any success after T0
+        if self.stopping_criterion == "pre_iter":
+            if bool(torch.any(tensors['valid_solutions']).item()):
+                fallback_errors = torch.where(
+                    tensors['valid_solutions'].view(-1, 1).to(torch.bool),
+                    tensors['best_errors'],
+                    tensors['hard_dec'],
+                )
+                errors = bitpack_errors(fallback_errors) if self.bitpack_output else fallback_errors
+                iters = torch.where(
+                    tensors['first_iter'] >= 0,
+                    tensors['first_iter'],
+                    tensors['iter_counter'].expand_as(tensors['first_iter'])
+                )
+                return {
+                    "errors": errors,
+                    "weights": tensors['best_weights'],
+                    "valid_mask": tensors['valid_solutions'],
+                    "iterations": iters,
+                }
         
         # Relay legs (R times)
         for leg in range(self.num_sets):
-            # Sample disordered gamma
-            gamma_min, gamma_max = self.gamma_dist_interval
-            gamma_leg = sample_gamma_uniform(B, self.V, gamma_min, gamma_max, self.device, self.seed + leg)
-            tensors['gamma'][:] = gamma_leg
+            # Set leg gamma: explicit set (deterministic) or sampled uniform
+            if self.explicit_gammas is not None:
+                K = int(self.explicit_gammas.shape[0])
+                row = self.explicit_gammas[(leg % K)]  # [V]
+                tensors['gamma'].copy_(row.unsqueeze(0).expand(B, -1))
+            else:
+                gamma_min, gamma_max = self.gamma_dist_interval
+                gamma_leg = sample_gamma_uniform(B, self.V, gamma_min, gamma_max, self.device, self.seed + leg)
+                tensors['gamma'][:] = gamma_leg
+
+            # Rust-equivalent per-leg reinitialization of messages:
+            # reset variable<->check messages (mu, nu) at the start of each leg
+            # while keeping current beliefs (lambda_) carried over
+            #self._launch_init_kernel(tensors, B)
             
             for t in range(self.set_max_iter):
                 # Per-iter alpha schedule
@@ -1019,7 +1084,7 @@ class RelayBPDecoder:
                     reduce_all_ge_kernel[(1,)](
                         tensors['found_count'], self.stop_nconv, tensors['all_done_flag'], B
                     )
-                    if tensors['all_done_flag'].item():
+                    if tensors['all_done_flag'].item() and self.stopping_criterion != "all":
                         break
             
             # Final parity check after the leg
@@ -1041,7 +1106,7 @@ class RelayBPDecoder:
             reduce_all_ge_kernel[(1,)](
                 tensors['found_count'], self.stop_nconv, tensors['all_done_flag'], B
             )
-            if tensors['all_done_flag'].item():
+            if tensors['all_done_flag'].item() and self.stopping_criterion != "all":
                 break
         
         # Prepare output

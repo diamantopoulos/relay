@@ -19,10 +19,7 @@ import json
 from pathlib import Path
 from typing import Dict, Any, List
 import csv
-
-# Import the reusable function from relay_bp_detailed
-from relay_bp_detailed import run_relay_bp_experiment, run_plain_bp_experiment
-
+from relay_bp_detailed import run_bp_experiment_core
 
 class RelayBPPaperStudy:
     """Study class for replicating the paper's methodology with systematic parameter sweeps.
@@ -190,18 +187,26 @@ class RelayBPPaperStudy:
         
         try:
             if algo == 'plain':
-                out = run_plain_bp_experiment(
+                out = run_bp_experiment_core(
+                    mode='plain',
                     circuit='bicycle_bivariate_144_12_12_memory_choi_XZ',
                     basis='xz',
                     distance=12,
                     rounds=12,
                     error_rate=0.003,
+                    gamma0=None,
+                    pre_iter=0,
+                    num_sets=0,
                     set_max_iter=config['set_max_iter'],
+                    gamma_dist_min=None,
+                    gamma_dist_max=None,
+                    stop_nconv=1,
                     alpha=config.get('alpha', None),
                     target_errors=20,
                     batch=config.get('batch', 2048),
                     max_shots=1,
                     parallel=True,
+                    seed=0,
                     backend=backend,
                     perf=perf,
                     dtype=dtype,
@@ -209,7 +214,8 @@ class RelayBPPaperStudy:
                 out['algo'] = 'plain'
                 out['set_max_iter'] = config['set_max_iter']
             else:
-                out = run_relay_bp_experiment(
+                out = run_bp_experiment_core(
+                    mode='relay',
                     circuit='bicycle_bivariate_144_12_12_memory_choi_XZ',
                     basis='xz',
                     distance=12,
@@ -222,10 +228,12 @@ class RelayBPPaperStudy:
                     gamma_dist_min=config['gamma_dist_interval'][0],
                     gamma_dist_max=config['gamma_dist_interval'][1],
                     stop_nconv=config['stop_nconv'],
+                    alpha=None,
                     target_errors=20,
                     batch=config.get('batch', 2048),
                     max_shots=100_000,
                     parallel=True,
+                    seed=0,
                     backend=backend,
                     perf=perf,
                     dtype=dtype,
