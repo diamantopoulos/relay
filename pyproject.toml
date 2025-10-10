@@ -69,6 +69,10 @@ stim = [
     "stim>=1.15",
     "beliefmatching"
 ]
+triton = [
+    "torch>=2.0.0",
+    "triton>=2.0.0",
+]
 
 [tool.maturin]
 python-source = "src"

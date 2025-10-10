@@ -19,10 +19,19 @@ Key features:
 - Multiple output formats (simple, JSON, CSV)
 """
 
+import sys
+import os
+
+# Add the development source to the path to use the unified interface
+# This MUST be done before any other imports that might import relay_bp
+script_dir = os.path.dirname(os.path.abspath(__file__))
+src_path = os.path.join(script_dir, 'src')
+if src_path not in sys.path:
+    sys.path.insert(0, src_path)
+
 import argparse
 import time
 import numpy as np
-import sys
 import random
 from pathlib import Path
 from datetime import datetime
@@ -34,7 +43,7 @@ import relay_bp
 from relay_bp.stim.sinter.check_matrices import CheckMatrices
 import hashlib
 import json
-from relay_bp_triton.utils import describe_check_matrices
+from relay_bp.triton.utils import describe_check_matrices
 
 def _select_backend(backend: str, dtype: str = 'fp32', require: str | None = None):
     """Select appropriate decoder classes for the chosen backend and data type.
@@ -54,33 +63,36 @@ def _select_backend(backend: str, dtype: str = 'fp32', require: str | None = Non
     Raises:
         ValueError: If requested dtype/backend combination is unavailable
     """
+    # Use the already imported relay_bp module
+    _rb = relay_bp
+    
     if backend == "triton":
         if dtype not in ("fp16", "fp32"):
             raise ValueError("Triton supports only dtype in {'fp16','fp32'}")
-        from relay_bp_triton.adapter import RelayDecoder as _RelayDecoderAdapter
-        from relay_bp_triton.adapter import ObservableDecoderRunner as _ObservableDecoderRunner
-        return _RelayDecoderAdapter, _ObservableDecoderRunner, None
-    # rust (dtype-selected, mode-specific requirement)
-    import relay_bp as _rb
-    if dtype not in ("fp32", "fp64"):
-        raise ValueError("Rust backend supports only dtype in {'fp32','fp64'} (no fp16 exports present)")
-    relay_cls = None
-    minsum_cls = None
-    # dtype suffix mapping to Rust class names
-    suffix_map = {"fp16": "F16", "fp32": "F32", "fp64": "F64"}
-    suff = suffix_map[dtype]
-    if require in (None, 'relay'):
-        relay_name = f"RelayDecoder{suff}"
-        if not hasattr(_rb, relay_name):
-            raise ValueError(f"Requested Rust relay decoder '{relay_name}' not available. Install a build with this dtype.")
-        relay_cls = getattr(_rb, relay_name)
-    if require in (None, 'plain'):
-        minsum_name = f"MinSumBPDecoder{suff}"
-        if not hasattr(_rb, minsum_name):
-            raise ValueError(f"Requested Rust plain decoder '{minsum_name}' not available. Install a build with this dtype.")
-        minsum_cls = getattr(_rb, minsum_name)
-    from relay_bp import ObservableDecoderRunner as _ObservableDecoderRunner
-    return relay_cls, _ObservableDecoderRunner, minsum_cls
+        
+        # Use the new unified interface
+        relay_cls = _rb.select_decoder(backend="triton", dtype=dtype, algorithm="relay")
+        from relay_bp.triton.adapter import ObservableDecoderRunner as _ObservableDecoderRunner
+        return relay_cls, _ObservableDecoderRunner, None
+
+        
+    elif backend == "rust":
+        if dtype not in ("fp32", "fp64"):
+            raise ValueError("Rust backend supports only dtype in {'fp32','fp64'} (no fp16 exports present)")
+        
+        relay_cls = None
+        minsum_cls = None
+        
+        if require in (None, 'relay'):
+            relay_cls = _rb.select_decoder(backend="rust", dtype=dtype, algorithm="relay")
+        if require in (None, 'plain'):
+            minsum_cls = _rb.select_decoder(backend="rust", dtype=dtype, algorithm="plain")
+
+        from relay_bp import ObservableDecoderRunner as _ObservableDecoderRunner
+        return relay_cls, _ObservableDecoderRunner, minsum_cls
+    else:
+        raise ValueError(f"Unknown backend: {backend}. Available: {_rb.get_available_backends()}")
+
 
 
 def _format_time_units(ns: float) -> str:
@@ -318,8 +330,8 @@ def run_bp_experiment_core(
         )
     else:
         if backend == "triton":
-            from relay_bp_triton.adapter import RelayDecoder as _RelayDecoderFXX
-            from relay_bp_triton.adapter import ObservableDecoderRunner as _ObservableDecoderRunner
+            from relay_bp.triton.adapter import RelayDecoder as _RelayDecoderFXX
+            from relay_bp.triton.adapter import ObservableDecoderRunner as _ObservableDecoderRunner
             decoder = _RelayDecoderFXX(
                 check_matrices.check_matrix,
                 error_priors=check_matrices.error_priors,
@@ -361,7 +373,7 @@ def run_bp_experiment_core(
     # Warmup (Triton only)
     if backend == 'triton':
         try:
-            from relay_bp_triton.utils import warmup_build_and_decode
+            from relay_bp.triton.utils import warmup_build_and_decode
             if mode == 'relay':
                 warmup_build_and_decode(
                     check_matrices=check_matrices, dem=dem, backend=backend, algo='relay', perf=perf, dtype=dtype,
