@@ -20,23 +20,120 @@ The Relay-BP-S (Relay Belief Propagation with Stopping) algorithm is a quantum e
 
 ## Installation
 
-```bash
-# Install from the project root
-pip install -r requirements.txt
+### Option 1: Development installation from source (Recommended)
 
-# Or install the package in development mode
-pip install -e .
+```bash
+# Clone the repository
+git clone <repository-url>
+cd relay
+
+# Install the main package with Triton support
+pip install -e ".[triton]"
+```
+
+This provides seamless integration with the Rust implementation and allows you to switch between backends:
+
+```python
+import relay_bp
+
+# Check available backends
+print(relay_bp.get_available_backends())  # ['rust', 'triton']
+
+# Select Triton backend
+decoder = relay_bp.select_decoder(backend="triton", dtype="fp16")
+```
+
+### Option 2: Use source files directly (No installation)
+
+For development or testing without installing the package:
+
+```bash
+# Clone the repository
+git clone <repository-url>
+cd relay
+
+# Install only the required dependencies
+pip install torch>=2.0.0 triton>=2.0.0 numpy scipy
+
+# Add the source directory to Python path
+export PYTHONPATH="${PYTHONPATH}:$(pwd)/src"
+```
+
+Then you can import and use the Triton implementation directly:
+
+```python
+# Import directly from source files
+from relay_bp.triton import RelayBPDecoder
+import numpy as np
+from scipy.sparse import csr_matrix
+
+# Use the decoder directly
+H_csr = csr_matrix(np.array([[1, 1, 0], [0, 1, 1]], dtype=np.uint8))
+error_priors = np.array([0.01, 0.01, 0.01])
+
+decoder = RelayBPDecoder(
+    H_csr=H_csr,
+    error_priors=error_priors,
+    gamma0=0.65,
+    pre_iter=80,
+    num_sets=100,
+    set_max_iter=60,
+    gamma_dist_interval=(-0.24, 0.66),
+    stop_nconv=5,
+    dtype_messages="fp16",
+    device="cuda"
+)
 ```
 
 ## Quick Start
 
-### Basic Usage
+### Option 1: Using the integrated relay-bp package (Recommended)
+
+```python
+import relay_bp
+import numpy as np
+from scipy.sparse import csr_matrix
+
+# Create check matrix representing quantum code stabilizer generators
+H_csr = csr_matrix(np.array([
+    [1, 1, 0],  # First stabilizer generator
+    [0, 1, 1]   # Second stabilizer generator
+], dtype=np.uint8))
+
+# Error probabilities for each qubit
+error_priors = np.array([0.01, 0.01, 0.01])
+
+# Create Triton decoder using the integrated interface
+decoder = relay_bp.select_decoder(
+    backend="triton",
+    dtype="fp16"
+)(
+    check_matrix=H_csr,
+    error_priors=error_priors,
+    gamma0=0.65,                    # γ₀: ordered memory strength
+    pre_iter=80,                    # T₀: iterations for ordered memory phase
+    num_sets=100,                   # R: number of relay legs/ensembles
+    set_max_iter=60,                # Tᵣ: iterations per relay set
+    gamma_dist_interval=(-0.24, 0.66),  # Disordered γ sampling range
+    stop_nconv=5,                   # S: number of solutions to collect
+    stopping_criterion="nconv",     # "nconv" | "pre_iter" | "all"
+    device="cuda"
+)
+
+# Decode syndromes (quantum measurement outcomes)
+syndromes = np.array([[1, 1], [0, 1]], dtype=np.uint8)
+result = decoder.decode(syndromes)
+
+print("Decoded errors:", result)
+```
+
+### Option 2: Using source files directly
 
 ```python
 import torch
 import numpy as np
 from scipy.sparse import csr_matrix
-from relay_bp_triton import RelayBPDecoder
+from relay_bp.triton import RelayBPDecoder
 
 # Create check matrix representing quantum code stabilizer generators
 H_csr = csr_matrix(np.array([
@@ -72,15 +169,51 @@ print("Valid solutions:", result["valid_mask"])
 print("Iterations used:", result["iterations"])
 ```
 
-### Using the Adapter Interface
+### Backend Selection and Comparison
 
-For compatibility with existing `relay_bp` package tools:
+The integrated package allows you to easily switch between Rust and Triton backends:
 
 ```python
-from relay_bp_triton import RelayDecoder, ObservableDecoderRunner
+import relay_bp
+import numpy as np
+from scipy.sparse import csr_matrix
 
-# Create adapter decoder
-decoder = RelayDecoder(
+# Create test data
+H_csr = csr_matrix(np.array([[1, 1, 0], [0, 1, 1]], dtype=np.uint8))
+error_priors = np.array([0.01, 0.01, 0.01])
+syndromes = np.array([[1, 1], [0, 1]], dtype=np.uint8)
+
+# Compare backends
+for backend in ["rust", "triton"]:
+    if backend in relay_bp.get_available_backends():
+        decoder = relay_bp.select_decoder(backend=backend, dtype="fp32")(
+            check_matrix=H_csr,
+            error_priors=error_priors,
+            gamma0=0.65,
+            pre_iter=80,
+            num_sets=100,
+            set_max_iter=60,
+            gamma_dist_interval=(-0.24, 0.66),
+            stop_nconv=5
+        )
+        
+        result = decoder.decode(syndromes)
+        print(f"{backend.upper()} backend result:", result)
+```
+
+### Observable Decoding
+
+For logical error detection and observable decoding:
+
+```python
+# Using the integrated interface
+from relay_bp import ObservableDecoderRunner
+
+# Create observable matrix (e.g., logical operators)
+observable_matrix = csr_matrix(np.array([[1, 0, 0]], dtype=np.uint8))
+
+# Create decoder (works with both backends)
+decoder = relay_bp.select_decoder(backend="triton", dtype="fp16")(
     check_matrix=H_csr,
     error_priors=error_priors,
     gamma0=0.65,
@@ -88,13 +221,8 @@ decoder = RelayDecoder(
     num_sets=100,
     set_max_iter=60,
     gamma_dist_interval=(-0.24, 0.66),
-    stop_nconv=5,
-    stopping_criterion="nconv"
+    stop_nconv=5
 )
-
-# Decode single syndrome
-syndrome = np.array([1, 1], dtype=np.uint8)
-error_pattern = decoder.decode(syndrome)
 
 # Batch processing with observable decoding
 runner = ObservableDecoderRunner(decoder, observable_matrix)
@@ -248,17 +376,33 @@ python relay_bp_detailed.py --backend triton --dtype fp16 --num_shots 10000
 - Triton 2.0+
 - CUDA-capable GPU (Compute Capability 7.0+) or ROCm-compatible GPU
 - NumPy, SciPy
-- Optional: `relay_bp` package for equivalence testing
+- Rust toolchain (only for development installation)
 
-## Architecture
+## Implementation Relationship
 
-The implementation consists of several key components:
+This Triton implementation maintains **algorithmic fidelity** with the original Rust implementation in `crates/relay_bp/src/`. Both implementations follow the same Relay-BP-S algorithm:
 
-- **`decoder.py`**: Main decoder class and orchestration logic
-- **`kernels.py`**: Triton GPU kernels for belief propagation
+### Rust Implementation (`crates/relay_bp/src/`)
+- **`bp/relay.rs`**: Core Relay-BP algorithm with ensemble decoding
+- **`bp/min_sum.rs`**: Min-sum belief propagation with memory (MemBP)
+- **`decoder.rs`**: Decoder trait and batch processing infrastructure
+- **`bipartite_graph.rs`**: Sparse bipartite graph representation
+
+### Triton Implementation (`src/relay_bp/triton/`)
+- **`decoder.py`**: GPU-accelerated Relay-BP decoder with same algorithm
+- **`kernels.py`**: Triton GPU kernels implementing the same message passing
+- **`adapter.py`**: Compatibility layer matching Rust interface
 - **`graph.py`**: GPU-optimized sparse matrix representation
 - **`utils.py`**: Utility functions for error priors, gamma sampling, and validation
-- **`adapter.py`**: Interface compatibility layer for `relay_bp` package
+
+### Key Algorithmic Equivalence
+Both implementations implement the same three innovations:
+1. **Disordered Memory Strengths**: Different γ values per variable to break trapping sets
+2. **Ensemble Decoding**: Multiple decoding attempts with different memory configurations  
+3. **Relaying**: Sharing ensemble posteriors to accelerate convergence
+
+The Triton version provides GPU acceleration while maintaining identical algorithmic behavior, enabling direct performance comparisons and validation against the Rust reference.
+
 
 ## License
 
