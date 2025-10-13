@@ -95,18 +95,11 @@ def _select_backend(backend: str, dtype: str = 'fp32', require: str | None = Non
 
 
 
-def _format_time_units(ns: float) -> str:
-    """Format time in nanoseconds to a compact multi-unit string.
-    
-    Args:
-        ns: Time in nanoseconds
-        
-    Returns:
-        Formatted string showing time in ns, µs, ms, and seconds
-    """
-    us = ns / 1e3
-    ms = ns / 1e6
-    s = ns / 1e9
+def _format_time_from_us(us: float) -> str:
+    """Format time in microseconds to a compact multi-unit string including ns."""
+    ns = us * 1e3
+    ms = us / 1e3
+    s = us / 1e6
     return f"{ns:.1f} ns | {us:.3f} µs | {ms:.3f} ms | {s:.6f} s"
 
 
@@ -488,18 +481,22 @@ def run_bp_experiment_core(
     # Per-shot and totals
     if start_time and end_time and total_shots > 0:
         total_runtime_seconds = end_time - start_time
-        results['runtime_per_shot_ns'] = float((total_runtime_seconds * 1e9) / total_shots)
-        results['total_runtime_ns'] = float(total_runtime_seconds * 1e9)
+        results['runtime_per_shot_us'] = float((total_runtime_seconds * 1e6) / total_shots)
+        results['total_runtime_us'] = float(total_runtime_seconds * 1e6)
     if total_decode_shots > 0:
         total_iterations = float(np.sum(bp_iters_all)) if bp_iters_all else 0.0
-        results['decoder_total_time_ns'] = int(total_decode_ns)
-        results['decoder_runtime_per_shot_ns'] = float(total_decode_ns / total_decode_shots)
+        # convert decoder times to microseconds
+        results['decoder_total_time_us'] = float(total_decode_ns) / 1e3
+        results['decoder_runtime_per_shot_us'] = (float(total_decode_ns) / 1e3) / float(total_decode_shots)
         if total_iterations > 0:
-            results['decoder_runtime_per_iteration_ns'] = float(total_decode_ns / total_iterations)
+            results['decoder_runtime_per_iteration_us'] = (float(total_decode_ns) / 1e3) / float(total_iterations)
+        # expose totals for downstream throughput computation
+        results['total_decode_shots'] = int(total_decode_shots)
+        results['total_iterations'] = float(total_iterations)
         if mode == 'relay' and legs_all:
             total_legs = float(np.sum(legs_all))
             if total_legs > 0:
-                results['decoder_runtime_per_leg_ns'] = float(total_decode_ns / total_legs)
+                results['decoder_runtime_per_leg_us'] = (float(total_decode_ns) / 1e3) / float(total_legs)
 
     # Attach diagnostic
     results['per_cycle_ler_alt_half_rounds'] = float(1 - (1 - logical_error_rate) ** (1 / max(1, 2 * rounds)))
@@ -627,19 +624,37 @@ def main():
         print(f"Per-Cycle Logical Error Rate: {results['per_cycle_logical_error_rate']:.2e}")
         legs_suffix = f" (legs: {results['avg_legs']:.1f})" if 'avg_legs' in results else ""
         print(f"Average BP Iterations: {results['avg_bp_iterations']:.1f}{legs_suffix}")
-        if 'runtime_per_shot_ns' in results:
-            print(f"Runtime per shot: {_format_time_units(results['runtime_per_shot_ns'])}")
+        if 'runtime_per_shot_us' in results:
+            print(f"Runtime per shot: {_format_time_from_us(results['runtime_per_shot_us'])}")
         # Decoder-only timing metrics if available
-        if 'decoder_runtime_per_shot_ns' in results:
-            print(f"Decoder runtime per shot: {_format_time_units(results['decoder_runtime_per_shot_ns'])}")
-        if 'decoder_runtime_per_iteration_ns' in results:
-            print(f"Decoder runtime per iteration: {_format_time_units(results['decoder_runtime_per_iteration_ns'])}")
-        if 'decoder_runtime_per_leg_ns' in results:
-            print(f"Decoder runtime per leg: {_format_time_units(results['decoder_runtime_per_leg_ns'])}")
-        if 'total_runtime_ns' in results:
-            print(f"Total runtime (Monte Carlo): {_format_time_units(results['total_runtime_ns'])}")
-        if 'decoder_total_time_ns' in results:
-            print(f"Decoder total time: {_format_time_units(results['decoder_total_time_ns'])}")
+        if 'decoder_runtime_per_shot_us' in results:
+            print(f"Decoder runtime per shot: {_format_time_from_us(results['decoder_runtime_per_shot_us'])}")
+        if 'decoder_runtime_per_iteration_us' in results:
+            print(f"Decoder runtime per iteration: {_format_time_from_us(results['decoder_runtime_per_iteration_us'])}")
+        if 'decoder_runtime_per_leg_us' in results:
+            print(f"Decoder runtime per leg: {_format_time_from_us(results['decoder_runtime_per_leg_us'])}")
+        if 'total_runtime_us' in results:
+            print(f"Total runtime (Monte Carlo): {_format_time_from_us(results['total_runtime_us'])}")
+        if 'decoder_total_time_us' in results:
+            print(f"Decoder total time: {_format_time_from_us(results['decoder_total_time_us'])}")
+        # Throughput metrics
+        wall_time_us = results.get('total_runtime_us')
+        shots_val = results.get('shots')
+        if wall_time_us is not None and shots_val is not None:
+            wall_time_s = float(wall_time_us) / 1e6
+            shots = float(shots_val)
+            if wall_time_s > 0.0 and shots > 0.0:
+                print(f"Shots per second (end-to-end): {shots / wall_time_s:.2f} shots/s")
+
+        dec_time_us_val = results.get('decoder_total_time_us')
+        total_decode_shots_val = results.get('total_decode_shots')
+        total_iterations_val = results.get('total_iterations')
+        if dec_time_us_val is not None and float(dec_time_us_val) > 0.0:
+            dec_time_s = float(dec_time_us_val) / 1e6
+            if total_decode_shots_val is not None and float(total_decode_shots_val) > 0.0:
+                print(f"Decoder shots per second: {float(total_decode_shots_val) / dec_time_s:.2f} shots/s")
+            if total_iterations_val is not None and float(total_iterations_val) > 0.0:
+                print(f"Iterations per second: {float(total_iterations_val) / dec_time_s:.2f} it/s")
         print(f"Determinism hash: {results.get('determinism_hash','-')}")
     
     elif args.output_format == 'json':

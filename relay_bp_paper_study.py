@@ -50,12 +50,30 @@ class RelayBPPaperStudy:
             # Experiment results
             'shots', 'logical_errors', 'logical_error_rate', 'per_cycle_logical_error_rate',
             'per_round_per_qubit_rate', 'avg_bp_iterations', 'avg_legs',
-            'runtime_per_shot_ns', 'decoder_runtime_per_shot_ns', 'decoder_runtime_per_iteration_ns', 'decoder_runtime_per_leg_ns',
-            'decoder_total_time_ns', 'wall_time_s'
+            # Timings in microseconds (field names now *_us)
+            'runtime_per_shot_us', 'decoder_runtime_per_shot_us', 'decoder_runtime_per_iteration_us', 'decoder_runtime_per_leg_us',
+            'decoder_total_time_us', 'wall_time_s',
+            # Throughput
+            'shots_per_sec', 'decoder_shots_per_sec', 'iterations_per_sec'
         ]
 
     def _row_from_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
         """Convert experiment result to CSV row format."""
+        # Convert ns->us if present
+        def passthrough_us(val):
+            return float(val) if (val is not None) else ''
+
+        total_runtime_us = result.get('total_runtime_us')
+        decoder_total_time_us = result.get('decoder_total_time_us')
+        total_decode_shots = result.get('total_decode_shots')
+        total_iterations = result.get('total_iterations')
+
+        wall_time_s = (float(total_runtime_us) / 1e6) if total_runtime_us else ''
+        shots = result.get('shots', 0) or 0
+        shots_per_sec = (shots / wall_time_s) if wall_time_s else ''
+        decoder_shots_per_sec = ((total_decode_shots or 0) / (float(decoder_total_time_us) / 1e6)) if decoder_total_time_us else ''
+        iterations_per_sec = ((total_iterations or 0.0) / (float(decoder_total_time_us) / 1e6)) if (decoder_total_time_us and total_iterations) else ''
+
         return {
             'config_name': result.get('config_name', ''),
             'algo': result.get('algo', ''),
@@ -82,12 +100,15 @@ class RelayBPPaperStudy:
             'per_round_per_qubit_rate': result.get('per_round_per_qubit_rate', ''),
             'avg_bp_iterations': result.get('avg_bp_iterations', ''),
             'avg_legs': result.get('avg_legs', ''),
-            'runtime_per_shot_ns': result.get('runtime_per_shot_ns', ''),
-            'decoder_runtime_per_shot_ns': result.get('decoder_runtime_per_shot_ns', ''),
-            'decoder_runtime_per_iteration_ns': result.get('decoder_runtime_per_iteration_ns', ''),
-            'decoder_runtime_per_leg_ns': result.get('decoder_runtime_per_leg_ns', ''),
-            'decoder_total_time_ns': result.get('decoder_total_time_ns', ''),
-            'wall_time_s': result.get('wall_time_s', ''),
+            'runtime_per_shot_us': passthrough_us(result.get('runtime_per_shot_us')),
+            'decoder_runtime_per_shot_us': passthrough_us(result.get('decoder_runtime_per_shot_us')),
+            'decoder_runtime_per_iteration_us': passthrough_us(result.get('decoder_runtime_per_iteration_us')),
+            'decoder_runtime_per_leg_us': passthrough_us(result.get('decoder_runtime_per_leg_us')),
+            'decoder_total_time_us': passthrough_us(result.get('decoder_total_time_us')),
+            'wall_time_s': wall_time_s,
+            'shots_per_sec': shots_per_sec,
+            'decoder_shots_per_sec': decoder_shots_per_sec,
+            'iterations_per_sec': iterations_per_sec,
         }
 
     def save_result_incremental(self, result: Dict[str, Any]):
