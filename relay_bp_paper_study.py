@@ -125,29 +125,29 @@ class RelayBPPaperStudy:
         """
         configs: List[Dict[str, Any]] = []
         backends = ['rust', 'triton']
-        batch_values = [100, 1000, 10000]  # Single batch for detailed analysis
+        batch_values = [100, 1000, 2500]  # Single batch for detailed analysis
         dtypes = ['fp32']
 
         # Plain BP sweep: vary max iterations to generate performance curves
         set_max_iter_values = [10, 20, 40, 60, 80, 100] #, 200, 300, 500, 600, 700, 1000, 1500, 2000, 5000, 10000]
-        for backend in backends:
-            for dtype in dtypes:
-                for tmax in set_max_iter_values:
-                    for batch in batch_values:
-                        configs.append({
-                            'name': f'PlainBP-maxiter{tmax}-B{batch}-{backend}-{dtype}',
-                            'algo': 'plain',
-                            'perf': 'default',
-                            'backend': backend,
-                            'dtype': dtype,
-                            'batch': batch,
-                            'set_max_iter': tmax,
-                            'alpha': None,
-                        })
+#        for backend in backends:
+#            for dtype in dtypes:
+#                for tmax in set_max_iter_values:
+#                    for batch in batch_values:
+#                        configs.append({
+#                            'name': f'PlainBP-maxiter{tmax}-B{batch}-{backend}-{dtype}',
+#                            'algo': 'plain',
+#                            'perf': 'default',
+#                            'backend': backend,
+#                            'dtype': dtype,
+#                            'batch': batch,
+#                            'set_max_iter': tmax,
+#                            'alpha': None,
+#                        })
 
         # Relay-BP sweep: S (stop_nconv) and R (num_sets) parameter grid
-        stop_nconv_values = [1] #, 2, 3, 5, 7, 9]
-        num_sets_values = [1, 100] #, 3, 5, 9, 13, 21, 45]
+        stop_nconv_values = [1, 2] #, 2, 3, 5, 7, 9]
+        num_sets_values = [1, 10, 50, 100] #, 3, 5, 9, 13, 21, 45]
         for backend in backends:
             for dtype in dtypes:
                 for s in stop_nconv_values:
